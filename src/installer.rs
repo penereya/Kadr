@@ -11,7 +11,7 @@ use std::process::Command;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-static KADR_EXE: &[u8] = include_bytes!("../Kadr.exe");
+static KADR_EXE: &[u8] = include_bytes!("../target/release/kadr.exe");
 static KADR_ICO: &[u8] = include_bytes!("../assets/kadr.ico");
 
 fn load_app_icon() -> egui::IconData {
