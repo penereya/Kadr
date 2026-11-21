@@ -49,6 +49,18 @@ pub fn setup_fonts(ctx: &egui::Context) {
         }
     }
 
+    // Load Windows symbol font so geometric icons (⇄ ⇅ ↺ ↻ ✂ ✓ ⏮ ▶ ⏸) never render as missing squares
+    if let Ok(sym_bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+        fonts
+            .font_data
+            .insert("system_sym".to_owned(), FontData::from_owned(sym_bytes));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            let list = fonts.families.entry(family).or_default();
+            let pos = usize::from(list.first().map(|s| s == "system_ui").unwrap_or(false));
+            list.insert(pos, "system_sym".to_owned());
+        }
+    }
+
     ctx.set_fonts(fonts);
 }
 
@@ -109,7 +121,7 @@ pub fn apply_graphite_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
     style.spacing.slider_width = 180.0;
-    style.spacing.interact_size = Vec2::new(36.0, 28.0);
+    style.spacing.interact_size = Vec2::new(36.0, 18.0);
     style.interaction.tooltip_delay = 0.35;
     ctx.set_style(style);
 }
@@ -199,7 +211,6 @@ pub fn metadata_pill(ui: &mut egui::Ui, label: &str) {
 struct HoldRepeatState {
     started_at: std::time::Instant,
     last_tick: std::time::Instant,
-    repeated: bool,
 }
 
 fn step_repeat_button(ui: &mut egui::Ui, id_salt: &str, label: &str, tooltip: &str) -> i32 {
@@ -224,36 +235,40 @@ fn step_repeat_button(ui: &mut egui::Ui, id_salt: &str, label: &str, tooltip: &s
 
     let existing = ui.ctx().data_mut(|d| d.get_temp::<HoldRepeatState>(state_id));
 
-    if resp.is_pointer_button_down_on() || (existing.is_some() && pointer_down) {
-        let mut st = existing.unwrap_or(HoldRepeatState {
-            started_at: now,
-            last_tick: now,
-            repeated: false,
-        });
-
-        let held_secs = now.duration_since(st.started_at).as_secs_f32();
-        if held_secs >= 0.25 && now.duration_since(st.last_tick).as_secs_f32() >= 0.03 {
-            st.last_tick = now;
-            st.repeated = true;
-            step = if held_secs >= 1.5 {
-                5
-            } else if held_secs >= 0.6 {
-                2
-            } else {
-                1
-            };
+    if resp.hovered() && pointer_down && (resp.is_pointer_button_down_on() || existing.is_some()) {
+        if let Some(mut st) = existing {
+            let held_secs = now.duration_since(st.started_at).as_secs_f32();
+            if held_secs >= 0.25 && now.duration_since(st.last_tick).as_secs_f32() >= 0.03 {
+                st.last_tick = now;
+                step = if held_secs >= 1.5 {
+                    5
+                } else if held_secs >= 0.6 {
+                    2
+                } else {
+                    1
+                };
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(state_id, st));
+        } else {
+            // Immediate 1-step feedback on initial press
+            step = 1;
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    state_id,
+                    HoldRepeatState {
+                        started_at: now,
+                        last_tick: now,
+                    },
+                )
+            });
         }
-
-        ui.ctx().data_mut(|d| d.insert_temp(state_id, st));
         ui.ctx().request_repaint();
     } else {
-        if let Some(st) = existing {
-            if !st.repeated {
-                step = 1;
-            }
+        if existing.is_some() {
             ui.ctx()
                 .data_mut(|d| d.remove::<HoldRepeatState>(state_id));
         } else if resp.clicked() {
+            // Keyboard / assistive activation without pointer-down hold state
             step = 1;
         }
         let _ = resp.on_hover_text(tooltip);
@@ -310,10 +325,12 @@ pub fn volume_slider_with_steps(ui: &mut egui::Ui, volume_pct: &mut f32) -> bool
 }
 
 pub fn format_time(secs: f64) -> String {
-    let total = secs.max(0.0);
-    let mins = (total / 60.0).floor() as u64;
-    let rem = total - (mins as f64 * 60.0);
-    format!("{:02}:{:04.1}", mins, rem)
+    let total_tenths = (secs.max(0.0) * 10.0).round() as u64;
+    let mins = total_tenths / 600;
+    let rem_tenths = total_tenths % 600;
+    let whole_secs = rem_tenths / 10;
+    let tenths = rem_tenths % 10;
+    format!("{:02}:{:02}.{}", mins, whole_secs, tenths)
 }
 
 pub fn parse_time(input: &str) -> Option<f64> {
@@ -357,6 +374,12 @@ pub fn parse_time(input: &str) -> Option<f64> {
     }
 }
 
+#[derive(Clone)]
+struct TimeEditBuf {
+    text: String,
+    initial: String,
+}
+
 /// Editable time input (`MM:SS.d`, `HH:MM:SS`, or seconds). Returns `true` when user commits a new value.
 pub fn editable_time_field(
     ui: &mut egui::Ui,
@@ -367,17 +390,21 @@ pub fn editable_time_field(
 ) -> bool {
     let text_id = ui.make_persistent_id(id_salt);
     let has_focus_before = ui.memory(|m| m.has_focus(text_id));
-    let mut buf = if has_focus_before {
-        ui.ctx()
-            .data_mut(|d| d.get_temp::<String>(text_id))
-            .unwrap_or_else(|| format_time(*secs))
+    let saved_state = if has_focus_before {
+        ui.ctx().data_mut(|d| d.get_temp::<TimeEditBuf>(text_id))
     } else {
-        format_time(*secs)
+        None
     };
+
+    let formatted = format_time(*secs);
+    let mut state = saved_state.unwrap_or_else(|| TimeEditBuf {
+        text: formatted.clone(),
+        initial: formatted,
+    });
 
     let resp = ui
         .add(
-            egui::TextEdit::singleline(&mut buf)
+            egui::TextEdit::singleline(&mut state.text)
                 .id(text_id)
                 .desired_width(72.0)
                 .horizontal_align(egui::Align::Center)
@@ -391,15 +418,15 @@ pub fn editable_time_field(
     if resp.has_focus() {
         if esc {
             resp.surrender_focus();
-            ui.ctx().data_mut(|d| d.remove::<String>(text_id));
+            ui.ctx().data_mut(|d| d.remove::<TimeEditBuf>(text_id));
         } else {
-            ui.ctx().data_mut(|d| d.insert_temp(text_id, buf.clone()));
+            ui.ctx().data_mut(|d| d.insert_temp(text_id, state.clone()));
         }
     }
 
     if resp.lost_focus() {
-        if !esc {
-            if let Some(parsed) = parse_time(&buf) {
+        if !esc && state.text != state.initial {
+            if let Some(parsed) = parse_time(&state.text) {
                 let clamped = parsed.clamp(min_secs, max_secs.max(min_secs));
                 if (clamped - *secs).abs() > 0.001 {
                     *secs = clamped;
@@ -407,7 +434,7 @@ pub fn editable_time_field(
                 }
             }
         }
-        ui.ctx().data_mut(|d| d.remove::<String>(text_id));
+        ui.ctx().data_mut(|d| d.remove::<TimeEditBuf>(text_id));
     }
 
     committed
@@ -426,5 +453,33 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.0} КБ", b / KB)
     } else {
         format!("{} Б", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_time, parse_time};
+
+    #[test]
+    fn format_time_avoids_60_seconds_rollover() {
+        assert_eq!(format_time(0.0), "00:00.0");
+        assert_eq!(format_time(59.94), "00:59.9");
+        assert_eq!(format_time(59.95), "01:00.0");
+        assert_eq!(format_time(59.99), "01:00.0");
+        assert_eq!(format_time(60.0), "01:00.0");
+        assert_ne!(format_time(59.95), "00:60.0");
+    }
+
+    #[test]
+    fn parse_time_handles_valid_and_invalid_inputs() {
+        assert_eq!(parse_time("01:30"), Some(90.0));
+        assert_eq!(parse_time("90"), Some(90.0));
+        assert_eq!(parse_time("1:02:03.5"), Some(3723.5));
+        assert_eq!(parse_time("01:30,5"), Some(90.5));
+
+        assert_eq!(parse_time(""), None);
+        assert_eq!(parse_time("abc"), None);
+        assert_eq!(parse_time("-5"), None);
+        assert_eq!(parse_time("1:2:3:4"), None);
     }
 }

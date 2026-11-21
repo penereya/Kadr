@@ -1,10 +1,10 @@
 use crate::audio::{self, AudioEditor};
 use crate::media;
-use crate::photo::PhotoEditor;
+use crate::photo::{self, PhotoEditor};
 use crate::theme;
 use crate::video::{self, VideoCanvasAction, VideoEditor};
 use eframe::egui::{self, Align, Color32, Layout, Margin, Pos2, Rect, Rounding, Stroke, Vec2};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -59,6 +59,7 @@ pub struct KadrApp {
     screenshot_out: Option<PathBuf>,
     screenshot_started: std::time::Instant,
     screenshot_sent: bool,
+    logo_texture: Option<egui::TextureHandle>,
 }
 
 fn settings_file_path() -> Option<PathBuf> {
@@ -98,6 +99,14 @@ fn save_ui_scale(scale: f32) {
     let _ = std::fs::write(path, format!("scale={:.2}\n", scale.clamp(0.8, 1.6)));
 }
 
+fn load_brand_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../assets/logo.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("kadr_brand_logo", color_img, egui::TextureOptions::LINEAR))
+}
+
 impl KadrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup_fonts(&cc.egui_ctx);
@@ -106,6 +115,7 @@ impl KadrApp {
 
         let saved_scale = load_ui_scale();
         cc.egui_ctx.set_zoom_factor(saved_scale);
+        let logo_texture = load_brand_logo(&cc.egui_ctx);
 
         let mut app = Self {
             tab: ActiveTab::Photo,
@@ -123,6 +133,7 @@ impl KadrApp {
             screenshot_out: None,
             screenshot_started: std::time::Instant::now(),
             screenshot_sent: false,
+            logo_texture,
         };
 
         let mut args = std::env::args_os().skip(1);
@@ -146,7 +157,7 @@ impl KadrApp {
         self.export_rx.is_some()
     }
 
-    fn detect_tab(path: &PathBuf) -> Option<ActiveTab> {
+    fn detect_tab(path: &Path) -> Option<ActiveTab> {
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
@@ -161,6 +172,9 @@ impl KadrApp {
     }
 
     fn open_file_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.video.stop_playback();
+        self.audio.stop_playback();
+
         let detected = Self::detect_tab(&path);
         // If user is on Audio tab and drops/opens a video, extract/edit its audio track right here
         let target_tab = if self.tab == ActiveTab::Audio && detected == Some(ActiveTab::Video) {
@@ -174,7 +188,7 @@ impl KadrApp {
         let res = match target_tab {
             ActiveTab::Photo => self.photo.load(path),
             ActiveTab::Video => self.video.load(path, ctx),
-            ActiveTab::Audio => self.audio.load(path),
+            ActiveTab::Audio => self.audio.load(path, ctx),
         };
 
         if let Err(err) = res {
@@ -412,12 +426,17 @@ impl KadrApp {
                 let mut right_start = bar_rect.right() - 250.0;
 
                 ui.horizontal_centered(|ui| {
-                    // Left: minimalist brand mark
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot_rect.center(), 4.5, theme::ACCENT);
-                    ui.add_space(4.0);
+                    // Left: brand logo + KADR
+                    let logo_sz = if compact { 28.0 } else { 32.0 };
+                    if let Some(tex) = &self.logo_texture {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(logo_sz)));
+                    } else {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 4.5, theme::ACCENT);
+                    }
+                    ui.add_space(6.0);
                     let brand_resp = ui.label(
                         egui::RichText::new("KADR")
                             .size(if compact { 14.5 } else { 16.0 })
@@ -663,8 +682,8 @@ impl KadrApp {
                 "MP4, MOV, MKV, WEBM, AVI",
             ),
             ActiveTab::Audio => (
-                "Перетащи MP3 или аудиофайл сюда",
-                "MP3, WAV, OGG, M4A, FLAC",
+                "Перетащи аудио или видео сюда",
+                "MP3, WAV, OGG, M4A, FLAC  •  из видео достанет звук",
             ),
         };
 
@@ -872,26 +891,24 @@ impl eframe::App for KadrApp {
                 )
                 .show(ctx, |ui| match self.tab {
                     ActiveTab::Photo => {
-                        if let Some(save_path) = self.photo.render_inspector(ui) {
-                            match self.photo.export(&save_path) {
-                                Ok(()) => {
-                                    let name = save_path
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("фото")
-                                        .to_string();
-                                    self.status = Some(StatusBanner {
-                                        kind: StatusKind::Success(Some(save_path)),
-                                        message: format!("Готово! Сохранено: {}", name),
-                                    });
-                                }
-                                Err(err) => {
-                                    self.status = Some(StatusBanner {
-                                        kind: StatusKind::Error,
-                                        message: err,
-                                    });
-                                }
-                            }
+                        let busy = self.is_busy();
+                        if let Some(job) = self.photo.render_inspector(ui, busy) {
+                            let (tx, rx) = mpsc::channel();
+                            self.export_rx = Some(rx);
+                            self.export_label = Some("Сохранение фото...".to_string());
+                            self.status = None;
+                            let ctx_clone = ctx.clone();
+                            std::thread::spawn(move || {
+                                let res = photo::run_photo_export(&job).map(|saved_path| {
+                                    ExportOutcome {
+                                        saved_path,
+                                        deleted_original: None,
+                                        warning: None,
+                                    }
+                                });
+                                let _ = tx.send(res);
+                                ctx_clone.request_repaint();
+                            });
                         }
                     }
                     ActiveTab::Video => {
@@ -903,6 +920,7 @@ impl eframe::App for KadrApp {
                             self.export_progress = Some(Arc::clone(&prog));
                             self.export_label = Some("Экспорт видео...".to_string());
                             self.status = None;
+                            let ctx_clone = ctx.clone();
                             std::thread::spawn(move || {
                                 let res = video::run_video_export(&job, prog).map(|r| ExportOutcome {
                                     saved_path: r.saved_path,
@@ -910,6 +928,7 @@ impl eframe::App for KadrApp {
                                     warning: r.warning,
                                 });
                                 let _ = tx.send(res);
+                                ctx_clone.request_repaint();
                             });
                         }
                     }
@@ -917,11 +936,14 @@ impl eframe::App for KadrApp {
                         let busy = self.is_busy();
                         if let Some(job) = self.audio.render_inspector(ui, busy) {
                             let (tx, rx) = mpsc::channel();
+                            let prog = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
                             self.export_rx = Some(rx);
+                            self.export_progress = Some(Arc::clone(&prog));
                             self.export_label = Some("Экспорт аудио...".to_string());
                             self.status = None;
+                            let ctx_clone = ctx.clone();
                             std::thread::spawn(move || {
-                                let res = audio::run_audio_export(&job).map(|saved_path| {
+                                let res = audio::run_audio_export(&job, prog).map(|saved_path| {
                                     ExportOutcome {
                                         saved_path,
                                         deleted_original: None,
@@ -929,6 +951,7 @@ impl eframe::App for KadrApp {
                                     }
                                 });
                                 let _ = tx.send(res);
+                                ctx_clone.request_repaint();
                             });
                         }
                     }
@@ -1010,5 +1033,10 @@ impl eframe::App for KadrApp {
                 }
             }
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.video.stop_playback();
+        self.audio.stop_playback();
     }
 }

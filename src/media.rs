@@ -1,9 +1,9 @@
 use eframe::egui;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -119,6 +119,8 @@ pub struct MediaInfo {
     pub width: u32,
     pub height: u32,
     pub codec: String,
+    pub audio_codec: String,
+    pub has_audio: bool,
     pub bitrate_kbps: u32,
     pub file_size: u64,
 }
@@ -139,9 +141,9 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
             "-v",
             "error",
             "-show_entries",
-            "format=duration,bit_rate:stream=width,height,codec_name,codec_type",
+            "format=duration,bit_rate:stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate",
             "-of",
-            "default=noprint_wrappers=1",
+            "default=noprint_wrappers=0",
         ])
         .arg(path)
         .output()
@@ -158,42 +160,91 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
         ..Default::default()
     };
 
-    for line in text.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim();
-            match k.trim() {
-                "duration" => {
-                    if let Ok(d) = v.parse::<f64>() {
-                        if d > info.duration_secs {
-                            info.duration_secs = d;
+    let mut in_stream = false;
+    let mut s_type = String::new();
+    let mut s_codec = String::new();
+    let mut s_w = 0_u32;
+    let mut s_h = 0_u32;
+    let mut s_rot = 0_i32;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        match line {
+            "[STREAM]" => {
+                in_stream = true;
+                s_type.clear();
+                s_codec.clear();
+                s_w = 0;
+                s_h = 0;
+                s_rot = 0;
+            }
+            "[/STREAM]" => {
+                if in_stream {
+                    if s_type == "video" {
+                        if info.codec.is_empty() && !s_codec.is_empty() {
+                            info.codec = s_codec.clone();
+                        }
+                        if info.width == 0 && s_w > 0 && s_h > 0 {
+                            if (s_rot.abs() % 180) == 90 {
+                                info.width = s_h;
+                                info.height = s_w;
+                            } else {
+                                info.width = s_w;
+                                info.height = s_h;
+                            }
+                        }
+                    } else if s_type == "audio" {
+                        info.has_audio = true;
+                        if info.audio_codec.is_empty() && !s_codec.is_empty() {
+                            info.audio_codec = s_codec.clone();
+                        }
+                    }
+                    in_stream = false;
+                }
+            }
+            _ => {
+                if let Some((k, v)) = line.split_once('=') {
+                    let k = k.trim();
+                    let v = v.trim();
+                    if in_stream {
+                        match k {
+                            "codec_type" => s_type = v.to_lowercase(),
+                            "codec_name" if !v.is_empty() => s_codec = v.to_uppercase(),
+                            "width" => {
+                                if let Ok(w) = v.parse::<u32>() {
+                                    s_w = w;
+                                }
+                            }
+                            "height" => {
+                                if let Ok(h) = v.parse::<u32>() {
+                                    s_h = h;
+                                }
+                            }
+                            "rotation" | "TAG:rotate" => {
+                                if let Ok(r) = v.parse::<f64>() {
+                                    s_rot = r.round() as i32;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match k {
+                            "duration" => {
+                                if let Ok(d) = v.parse::<f64>() {
+                                    if d > info.duration_secs {
+                                        info.duration_secs = d;
+                                    }
+                                }
+                            }
+                            "bit_rate" => {
+                                if let Ok(br) = v.parse::<u64>() {
+                                    info.bitrate_kbps = (br / 1000) as u32;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
-                "bit_rate" => {
-                    if let Ok(br) = v.parse::<u64>() {
-                        info.bitrate_kbps = (br / 1000) as u32;
-                    }
-                }
-                "width" => {
-                    if let Ok(w) = v.parse::<u32>() {
-                        if w > 0 {
-                            info.width = w;
-                        }
-                    }
-                }
-                "height" => {
-                    if let Ok(h) = v.parse::<u32>() {
-                        if h > 0 {
-                            info.height = h;
-                        }
-                    }
-                }
-                "codec_name" => {
-                    if info.codec.is_empty() && !v.is_empty() {
-                        info.codec = v.to_uppercase();
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -277,6 +328,7 @@ pub fn extract_waveform(path: &Path, bars: usize) -> Result<Vec<f32>, String> {
         .args(["-v", "error", "-i"])
         .arg(path)
         .args([
+            "-vn",
             "-ac", "1",
             "-ar", "4000",
             "-f", "s16le",
@@ -657,6 +709,166 @@ pub fn spawn_live_audio_stream(
     Some(child_arc)
 }
 
+pub fn is_same_file(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| -> String {
+        let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| {
+            if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                if let Ok(cp) = std::fs::canonicalize(parent) {
+                    return cp.join(name);
+                }
+            }
+            p.to_path_buf()
+        });
+        let s = resolved.to_string_lossy().into_owned();
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        #[cfg(windows)]
+        {
+            s.to_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            s
+        }
+    };
+    norm(a) == norm(b)
+}
+
+pub fn temp_output_path(dest: &Path) -> PathBuf {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let stem = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("kadr_out");
+    let ext = dest
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tmp");
+    parent.join(format!("{}.__kadr_tmp.{}", stem, ext))
+}
+
+pub fn finalize_temp_replace(tmp: &Path, dest: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(tmp).map_err(|e| format!("Ошибка временного файла: {}", e))?;
+    if meta.len() == 0 {
+        let _ = std::fs::remove_file(tmp);
+        return Err("Временный файл пуст".to_string());
+    }
+
+    let backup = temp_output_path(dest).with_extension("kadr_bak");
+    if backup.exists() {
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    let had_dest = dest.exists();
+    if had_dest {
+        std::fs::rename(dest, &backup)
+            .map_err(|e| format!("Не удалось обновить файл (возможно, он открыт): {}", e))?;
+    }
+
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => {
+            if had_dest {
+                let _ = std::fs::remove_file(&backup);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if had_dest {
+                let _ = std::fs::rename(&backup, dest);
+            }
+            let _ = std::fs::remove_file(tmp);
+            Err(format!("Не удалось сохранить файл: {}", err))
+        }
+    }
+}
+
+pub fn detect_hw_h264_encoder() -> Option<&'static str> {
+    static HW_H264: OnceLock<Option<&'static str>> = OnceLock::new();
+    *HW_H264.get_or_init(|| {
+        for enc in ["h264_nvenc", "h264_qsv", "h264_amf"] {
+            let ok = hidden_command("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=256x256:d=0.1",
+                    "-c:v",
+                    enc,
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(enc);
+            }
+        }
+        None
+    })
+}
+
+pub fn execute_ffmpeg_with_progress(
+    mut cmd: Command,
+    out: &Path,
+    total_secs: f64,
+    progress: Arc<AtomicU32>,
+) -> Result<PathBuf, String> {
+    cmd.args(["-progress", "pipe:1", "-nostats"]);
+    cmd.arg(out);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
+
+    let stderr_handle = child.stderr.take().map(|err_pipe| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = BufReader::new(err_pipe).read_to_string(&mut s);
+            s
+        })
+    });
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(val) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = val.trim().parse::<i64>() {
+                    if us > 0 {
+                        let secs = us as f64 / 1_000_000.0;
+                        let frac = (secs / total_secs.max(0.1)).clamp(0.0, 0.99) as f32;
+                        progress.store(frac.to_bits(), Ordering::Relaxed);
+                    }
+                }
+            } else if line.trim() == "progress=end" {
+                progress.store(1.0_f32.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Ошибка ожидания ffmpeg: {}", e))?;
+
+    let stderr_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if !status.success() {
+        let last_line = stderr_text
+            .lines()
+            .last()
+            .unwrap_or("Неизвестная ошибка ffmpeg");
+        return Err(format!("Ошибка экспорта: {}", last_line));
+    }
+
+    progress.store(1.0_f32.to_bits(), Ordering::Relaxed);
+    Ok(out.to_path_buf())
+}
+
 #[cfg(not(windows))]
 pub fn spawn_live_audio_stream(
     _path: PathBuf,
@@ -667,4 +879,39 @@ pub fn spawn_live_audio_stream(
     _stop_flag: Arc<AtomicBool>,
 ) -> Option<Arc<Mutex<Option<Child>>>> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finalize_temp_replace, is_same_file, temp_output_path};
+
+    #[test]
+    fn same_file_and_temp_replace_workflow() {
+        let dir = std::env::temp_dir().join(format!("kadr_media_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+
+        let dest = dir.join("clip.mp4");
+        let other = dir.join("other.mp4");
+        std::fs::write(&dest, b"old-bytes").expect("write initial dest");
+
+        assert!(is_same_file(&dest, &dir.join(".").join("clip.mp4")));
+        assert!(!is_same_file(&dest, &other));
+
+        let tmp = temp_output_path(&dest);
+        assert_eq!(tmp.parent(), Some(dir.as_path()));
+        assert_ne!(tmp, dest);
+
+        std::fs::write(&tmp, b"new-bytes-123").expect("write temp file");
+        finalize_temp_replace(&tmp, &dest).expect("replace should succeed");
+
+        let content = std::fs::read(&dest).expect("read replaced file");
+        assert_eq!(content, b"new-bytes-123");
+        assert!(!tmp.exists());
+
+        let backup = temp_output_path(&dest).with_extension("kadr_bak");
+        assert!(!backup.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

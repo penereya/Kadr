@@ -3,7 +3,7 @@ use crate::theme;
 use eframe::egui::{
     self, Color32, CursorIcon, Pos2, Rect, Rounding, Stroke, TextureHandle, TextureOptions, Vec2,
 };
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -104,6 +104,10 @@ pub struct VideoExportJob {
     pub volume_pct: f32,
     pub format: VideoFormat,
     pub delete_original_after_export: bool,
+    pub source_video_codec: String,
+    pub source_audio_codec: String,
+    pub has_audio: bool,
+    pub source_ext: String,
 }
 
 pub struct VideoExportResult {
@@ -145,6 +149,7 @@ impl VideoPlayer {
         end_time: f64,
         width: u32,
         height: u32,
+        has_audio: bool,
         play_audio: bool,
         volume_pct: f32,
         ctx: egui::Context,
@@ -202,14 +207,18 @@ impl VideoPlayer {
         let muted = Arc::new(AtomicBool::new(!play_audio));
 
         // Synchronized audio stream via Windows waveOut with lock-free live volume control
-        let achild_opt = media::spawn_live_audio_stream(
-            path.to_path_buf(),
-            start_time,
-            duration,
-            Arc::clone(&volume_bits),
-            Arc::clone(&muted),
-            Arc::clone(&stop_flag),
-        );
+        let achild_opt = if has_audio {
+            media::spawn_live_audio_stream(
+                path.to_path_buf(),
+                start_time,
+                duration,
+                Arc::clone(&volume_bits),
+                Arc::clone(&muted),
+                Arc::clone(&stop_flag),
+            )
+        } else {
+            None
+        };
 
         let finished = Arc::new(AtomicBool::new(false));
         let video_child = Arc::new(Mutex::new(Some(vchild)));
@@ -432,6 +441,7 @@ impl VideoEditor {
         self.active_drag = TimelineDrag::None;
         self.resume_after_drag = false;
         self.needs_scrub_fetch = false;
+        self.save_dialog = None;
         self.history.clear();
         self.frame_snapshot = None;
     }
@@ -660,7 +670,7 @@ impl VideoEditor {
         } else {
             dur
         };
-        let play_audio = self.audio_mode != VideoAudioMode::Mute;
+        let play_audio = self.info.has_audio && self.audio_mode != VideoAudioMode::Mute;
 
         match VideoPlayer::start(
             &path,
@@ -668,6 +678,7 @@ impl VideoEditor {
             end.max(clamped_start + 0.1),
             self.info.width,
             self.info.height,
+            self.info.has_audio,
             play_audio,
             self.volume_pct,
             ctx.clone(),
@@ -773,6 +784,7 @@ impl VideoEditor {
         self.format = VideoFormat::Mp4;
         self.confirm_delete_open = false;
         self.active_drag = TimelineDrag::None;
+        self.save_dialog = None;
         self.history.clear();
         self.frame_snapshot = None;
         self.request_frame_async(ctx);
@@ -886,6 +898,7 @@ impl VideoEditor {
 
         // Top metadata bar with filename, Delete/Close buttons, and file metadata
         let compact_bar = ui.available_width() < 420.0;
+        let mut closed = false;
         ui.horizontal_wrapped(|ui| {
             if let Some(p) = &self.path {
                 let full_name = p
@@ -916,26 +929,28 @@ impl VideoEditor {
                     .clicked()
                 {
                     self.clear();
-                    return;
+                    closed = true;
                 }
             }
 
-            let remaining = ui.max_rect().right() - ui.cursor().left();
-            if remaining >= 220.0 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::metadata_pill(ui, &theme::format_bytes(self.info.file_size));
-                    if self.info.width > 0 && self.info.height > 0 {
-                        theme::metadata_pill(
-                            ui,
-                            &format!("{} × {}", self.info.width, self.info.height),
-                        );
-                    }
-                    theme::metadata_pill(ui, &theme::format_time(self.info.duration_secs));
-                });
+            if !closed {
+                let remaining = ui.max_rect().right() - ui.cursor().left();
+                if remaining >= 220.0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::metadata_pill(ui, &theme::format_bytes(self.info.file_size));
+                        if self.info.width > 0 && self.info.height > 0 {
+                            theme::metadata_pill(
+                                ui,
+                                &format!("{} × {}", self.info.width, self.info.height),
+                            );
+                        }
+                        theme::metadata_pill(ui, &theme::format_time(self.info.duration_secs));
+                    });
+                }
             }
         });
 
-        if !self.has_file() {
+        if closed || !self.has_file() {
             return action;
         }
 
@@ -1545,11 +1560,10 @@ impl VideoEditor {
                             VideoAudioMode::ExtractMp3,
                         ] {
                             if theme::pill_choice(ui, self.audio_mode == mode, mode.label()).clicked()
+                                && self.audio_mode != mode
                             {
-                                if self.audio_mode != mode {
-                                    self.audio_mode = mode;
-                                    self.sync_live_audio();
-                                }
+                                self.audio_mode = mode;
+                                self.sync_live_audio();
                             }
                         }
                     });
@@ -1743,6 +1757,11 @@ impl VideoEditor {
         if let Some(picked) = self.save_dialog.as_ref().and_then(|d| d.poll()) {
             self.save_dialog = None;
             if let (Some(input), Some(output)) = (self.path.clone(), picked) {
+                let source_ext = input
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 job = Some(VideoExportJob {
                     input,
                     output,
@@ -1756,6 +1775,10 @@ impl VideoEditor {
                     volume_pct: self.volume_pct,
                     format: self.format,
                     delete_original_after_export: self.delete_original_after_export,
+                    source_video_codec: self.info.codec.clone(),
+                    source_audio_codec: self.info.audio_codec.clone(),
+                    has_audio: self.info.has_audio,
+                    source_ext,
                 });
             }
         }
@@ -1783,8 +1806,7 @@ pub fn run_video_export(
         let out_ok = std::fs::metadata(&saved_path)
             .map(|m| m.len() > 0)
             .unwrap_or(false);
-        let same_file =
-            std::fs::canonicalize(&job.input).ok() == std::fs::canonicalize(&saved_path).ok();
+        let same_file = media::is_same_file(&job.input, &saved_path);
 
         if out_ok && !same_file {
             match media::move_to_trash(&job.input) {
@@ -1809,29 +1831,190 @@ fn execute_export_ffmpeg(
     job: &VideoExportJob,
     progress: Arc<AtomicU32>,
 ) -> Result<PathBuf, String> {
-    let mut cmd = media::hidden_command("ffmpeg");
-    cmd.arg("-y");
-
-    if job.trim_start > 0.01 {
-        cmd.args(["-ss", &format!("{:.3}", job.trim_start)]);
-    }
-
-    cmd.arg("-i").arg(&job.input);
+    let overwrite_in_place = media::is_same_file(&job.input, &job.output);
+    let actual_out = if overwrite_in_place {
+        media::temp_output_path(&job.output)
+    } else {
+        job.output.clone()
+    };
 
     let duration = (job.trim_end - job.trim_start).max(0.1);
-    cmd.args(["-t", &format!("{:.3}", duration)]);
-
     let has_volume_change = (job.volume_pct - 100.0).abs() > 0.5;
     let volume_filter = format!("volume={:.3}", (job.volume_pct / 100.0).max(0.0));
 
-    if job.audio_mode == VideoAudioMode::ExtractMp3 {
-        cmd.arg("-vn");
+    let res = if job.audio_mode == VideoAudioMode::ExtractMp3 {
+        if !job.has_audio {
+            return Err("В этом видео нет звуковой дорожки".to_string());
+        }
+        let mut cmd = media::hidden_command("ffmpeg");
+        cmd.arg("-y");
+        if job.trim_start > 0.01 {
+            cmd.args(["-ss", &format!("{:.3}", job.trim_start)]);
+        }
+        cmd.arg("-i").arg(&job.input);
+        cmd.args(["-t", &format!("{:.3}", duration), "-vn"]);
         if has_volume_change {
             cmd.args(["-af", &volume_filter]);
         }
         cmd.args(["-c:a", "libmp3lame", "-q:a", "2"]);
-        return execute_ffmpeg_with_progress(cmd, &job.output, duration, progress);
+        media::execute_ffmpeg_with_progress(cmd, &actual_out, duration, progress)
+    } else if job.format == VideoFormat::Gif {
+        let mut cmd = media::hidden_command("ffmpeg");
+        cmd.arg("-y");
+        if job.trim_start > 0.01 {
+            cmd.args(["-ss", &format!("{:.3}", job.trim_start)]);
+        }
+        cmd.arg("-i").arg(&job.input);
+        cmd.args(["-t", &format!("{:.3}", duration)]);
+        let mut vf_parts: Vec<String> = Vec::new();
+        media::push_video_transform_filters(
+            &mut vf_parts,
+            job.rotation_deg,
+            job.flip_h,
+            job.flip_v,
+        );
+        vf_parts.push("fps=12,scale='min(640,iw)':-2:flags=lanczos".to_string());
+        cmd.args(["-vf", &vf_parts.join(",")]);
+        media::execute_ffmpeg_with_progress(cmd, &actual_out, duration, progress)
+    } else if job.format == VideoFormat::Webm {
+        let cmd = build_webm_cmd(job, duration, has_volume_change, &volume_filter);
+        media::execute_ffmpeg_with_progress(cmd, &actual_out, duration, progress)
+    } else {
+        // MP4 / MOV: 1) instant stream-copy when lossless/untransformed, 2) GPU encoder, 3) CPU libx264 fallback
+        let can_copy_video = job.quality == VideoQuality::Original
+            && job.rotation_deg.is_multiple_of(360)
+            && !job.flip_h
+            && !job.flip_v
+            && job.trim_start <= 0.05
+            && matches!(job.source_video_codec.as_str(), "H264" | "HEVC")
+            && matches!(job.source_ext.as_str(), "mp4" | "mov" | "mkv" | "m4v");
+
+        if can_copy_video {
+            let cmd = build_mp4_stream_copy_cmd(job, duration, has_volume_change, &volume_filter);
+            match media::execute_ffmpeg_with_progress(
+                cmd,
+                &actual_out,
+                duration,
+                Arc::clone(&progress),
+            ) {
+                Ok(p) => Ok(p),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&actual_out);
+                    progress.store(0.0_f32.to_bits(), Ordering::Relaxed);
+                    encode_mp4_with_hw_fallback(
+                        job,
+                        duration,
+                        has_volume_change,
+                        &volume_filter,
+                        &actual_out,
+                        progress,
+                    )
+                }
+            }
+        } else {
+            encode_mp4_with_hw_fallback(
+                job,
+                duration,
+                has_volume_change,
+                &volume_filter,
+                &actual_out,
+                progress,
+            )
+        }
+    };
+
+    if overwrite_in_place {
+        match res {
+            Ok(_) => {
+                media::finalize_temp_replace(&actual_out, &job.output)?;
+                Ok(job.output.clone())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&actual_out);
+                Err(e)
+            }
+        }
+    } else {
+        res
     }
+}
+
+fn encode_mp4_with_hw_fallback(
+    job: &VideoExportJob,
+    duration: f64,
+    has_volume_change: bool,
+    volume_filter: &str,
+    actual_out: &Path,
+    progress: Arc<AtomicU32>,
+) -> Result<PathBuf, String> {
+    if let Some(hw_enc) = media::detect_hw_h264_encoder() {
+        let hw_cmd =
+            build_mp4_encode_cmd(job, duration, has_volume_change, volume_filter, Some(hw_enc));
+        match media::execute_ffmpeg_with_progress(
+            hw_cmd,
+            actual_out,
+            duration,
+            Arc::clone(&progress),
+        ) {
+            Ok(p) => return Ok(p),
+            Err(_) => {
+                let _ = std::fs::remove_file(actual_out);
+                progress.store(0.0_f32.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+    let cpu_cmd = build_mp4_encode_cmd(job, duration, has_volume_change, volume_filter, None);
+    media::execute_ffmpeg_with_progress(cpu_cmd, actual_out, duration, progress)
+}
+
+fn push_mp4_audio_args(
+    cmd: &mut std::process::Command,
+    job: &VideoExportJob,
+    has_volume_change: bool,
+    volume_filter: &str,
+) {
+    if !job.has_audio || job.audio_mode == VideoAudioMode::Mute {
+        cmd.arg("-an");
+        return;
+    }
+    if !has_volume_change && job.source_audio_codec == "AAC" {
+        cmd.args(["-c:a", "copy"]);
+    } else {
+        if has_volume_change {
+            cmd.args(["-af", volume_filter]);
+        }
+        cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+}
+
+fn build_mp4_stream_copy_cmd(
+    job: &VideoExportJob,
+    duration: f64,
+    has_volume_change: bool,
+    volume_filter: &str,
+) -> std::process::Command {
+    let mut cmd = media::hidden_command("ffmpeg");
+    cmd.arg("-y").arg("-i").arg(&job.input);
+    cmd.args(["-t", &format!("{:.3}", duration), "-c:v", "copy"]);
+    push_mp4_audio_args(&mut cmd, job, has_volume_change, volume_filter);
+    cmd.args(["-movflags", "+faststart"]);
+    cmd
+}
+
+fn build_mp4_encode_cmd(
+    job: &VideoExportJob,
+    duration: f64,
+    has_volume_change: bool,
+    volume_filter: &str,
+    hw_enc: Option<&str>,
+) -> std::process::Command {
+    let mut cmd = media::hidden_command("ffmpeg");
+    cmd.arg("-y");
+    if job.trim_start > 0.01 {
+        cmd.args(["-ss", &format!("{:.3}", job.trim_start)]);
+    }
+    cmd.arg("-i").arg(&job.input);
+    cmd.args(["-t", &format!("{:.3}", duration)]);
 
     let mut vf_parts: Vec<String> = Vec::new();
     media::push_video_transform_filters(
@@ -1840,127 +2023,104 @@ fn execute_export_ffmpeg(
         job.flip_h,
         job.flip_v,
     );
+    vf_parts.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
+    cmd.args(["-vf", &vf_parts.join(",")]);
 
-    if job.format == VideoFormat::Gif {
-        vf_parts.push("fps=12,scale='min(640,iw)':-1:flags=lanczos".to_string());
-        cmd.args(["-vf", &vf_parts.join(",")]);
-        return execute_ffmpeg_with_progress(cmd, &job.output, duration, progress);
-    }
+    let cq = match job.quality {
+        VideoQuality::Original => "19",
+        VideoQuality::High => "22",
+        VideoQuality::Balanced => "27",
+        VideoQuality::Compact => "33",
+    };
 
-    if !vf_parts.is_empty() {
-        cmd.args(["-vf", &vf_parts.join(",")]);
-    }
-
-    match job.format {
-        VideoFormat::Mp4 | VideoFormat::Mov => {
+    match hw_enc {
+        Some("h264_nvenc") => {
+            cmd.args([
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+                "-pix_fmt", "yuv420p",
+            ]);
+        }
+        Some("h264_qsv") => {
+            cmd.args([
+                "-c:v", "h264_qsv", "-global_quality", cq, "-pix_fmt", "nv12",
+            ]);
+        }
+        Some("h264_amf") => {
+            cmd.args([
+                "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", cq, "-qp_p",
+                cq, "-pix_fmt", "yuv420p",
+            ]);
+        }
+        _ => {
             cmd.args([
                 "-c:v",
                 "libx264",
                 "-preset",
-                "medium",
+                "fast",
+                "-threads",
+                "0",
                 "-crf",
                 job.quality.crf(),
                 "-pix_fmt",
                 "yuv420p",
             ]);
-            match job.audio_mode {
-                VideoAudioMode::Keep => {
-                    if has_volume_change {
-                        cmd.args(["-af", &volume_filter]);
-                    }
-                    cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-                }
-                VideoAudioMode::Mute => {
-                    cmd.arg("-an");
-                }
-                VideoAudioMode::ExtractMp3 => {}
-            }
         }
-        VideoFormat::Webm => {
-            cmd.args([
-                "-c:v",
-                "libvpx-vp9",
-                "-crf",
-                job.quality.crf(),
-                "-b:v",
-                "0",
-            ]);
-            match job.audio_mode {
-                VideoAudioMode::Keep => {
-                    if has_volume_change {
-                        cmd.args(["-af", &volume_filter]);
-                    }
-                    cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
-                }
-                VideoAudioMode::Mute => {
-                    cmd.arg("-an");
-                }
-                VideoAudioMode::ExtractMp3 => {}
-            }
-        }
-        VideoFormat::Gif => {}
     }
 
-    execute_ffmpeg_with_progress(cmd, &job.output, duration, progress)
+    push_mp4_audio_args(&mut cmd, job, has_volume_change, volume_filter);
+    cmd.args(["-movflags", "+faststart"]);
+    cmd
 }
 
-fn execute_ffmpeg_with_progress(
-    mut cmd: std::process::Command,
-    out: &Path,
-    total_secs: f64,
-    progress: Arc<AtomicU32>,
-) -> Result<PathBuf, String> {
-    cmd.args(["-progress", "pipe:1", "-nostats"]);
-    cmd.arg(out);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+fn build_webm_cmd(
+    job: &VideoExportJob,
+    duration: f64,
+    has_volume_change: bool,
+    volume_filter: &str,
+) -> std::process::Command {
+    let mut cmd = media::hidden_command("ffmpeg");
+    cmd.arg("-y");
+    if job.trim_start > 0.01 {
+        cmd.args(["-ss", &format!("{:.3}", job.trim_start)]);
+    }
+    cmd.arg("-i").arg(&job.input);
+    cmd.args(["-t", &format!("{:.3}", duration)]);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
+    let mut vf_parts: Vec<String> = Vec::new();
+    media::push_video_transform_filters(
+        &mut vf_parts,
+        job.rotation_deg,
+        job.flip_h,
+        job.flip_v,
+    );
+    vf_parts.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
+    cmd.args(["-vf", &vf_parts.join(",")]);
+    cmd.args([
+        "-c:v",
+        "libvpx-vp9",
+        "-row-mt",
+        "1",
+        "-cpu-used",
+        "4",
+        "-deadline",
+        "good",
+        "-threads",
+        "0",
+        "-crf",
+        job.quality.crf(),
+        "-b:v",
+        "0",
+    ]);
 
-    let stderr_handle = child.stderr.take().map(|err_pipe| {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = BufReader::new(err_pipe).read_to_string(&mut s);
-            s
-        })
-    });
-
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(val) = line.strip_prefix("out_time_us=") {
-                if let Ok(us) = val.trim().parse::<i64>() {
-                    if us > 0 {
-                        let secs = us as f64 / 1_000_000.0;
-                        let frac = (secs / total_secs.max(0.1)).clamp(0.0, 0.99) as f32;
-                        progress.store(frac.to_bits(), Ordering::Relaxed);
-                    }
-                }
-            } else if line.trim() == "progress=end" {
-                progress.store(1.0_f32.to_bits(), Ordering::Relaxed);
-            }
+    if !job.has_audio || job.audio_mode == VideoAudioMode::Mute {
+        cmd.arg("-an");
+    } else {
+        if has_volume_change {
+            cmd.args(["-af", volume_filter]);
         }
+        cmd.args(["-c:a", "libopus", "-b:a", "128k"]);
     }
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Ошибка ожидания ffmpeg: {}", e))?;
-
-    let stderr_text = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-
-    if !status.success() {
-        let last_line = stderr_text
-            .lines()
-            .last()
-            .unwrap_or("Неизвестная ошибка ffmpeg");
-        return Err(format!("Ошибка экспорта: {}", last_line));
-    }
-
-    progress.store(1.0_f32.to_bits(), Ordering::Relaxed);
-    Ok(out.to_path_buf())
+    cmd
 }
 
 fn paint_transformed_texture(

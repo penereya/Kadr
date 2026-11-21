@@ -2,8 +2,10 @@ use crate::theme;
 use eframe::egui::{
     self, Color32, CursorIcon, Pos2, Rect, Rounding, Stroke, TextureHandle, TextureOptions, Vec2,
 };
-use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
-use std::path::{Path, PathBuf};
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, ImageFormat};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PhotoFormat {
@@ -78,7 +80,7 @@ enum CropDrag {
 pub struct PhotoEditor {
     pub path: Option<PathBuf>,
     pub file_size: u64,
-    original: Option<DynamicImage>,
+    original: Option<Arc<DynamicImage>>,
     preview_base: Option<DynamicImage>,
     preview_texture: Option<TextureHandle>,
     dirty: bool,
@@ -115,6 +117,48 @@ pub struct PhotoEditor {
     save_dialog: Option<crate::media::PendingFileDialog>,
     history: crate::media::UndoHistory<PhotoSnapshot>,
     frame_snapshot: Option<PhotoSnapshot>,
+}
+
+#[derive(Clone)]
+pub struct PhotoExportJob {
+    pub original: Arc<DynamicImage>,
+    pub output: PathBuf,
+    pub rotation_steps: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub brightness: i32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub grayscale: bool,
+    pub is_cropped: bool,
+    pub crop_x0: f32,
+    pub crop_y0: f32,
+    pub crop_x1: f32,
+    pub crop_y1: f32,
+    pub custom_resize: bool,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub format: PhotoFormat,
+    pub jpeg_quality: u8,
+}
+
+#[derive(Clone, Copy)]
+struct PhotoTransformParams {
+    rotation_steps: u8,
+    flip_h: bool,
+    flip_v: bool,
+    brightness: i32,
+    contrast: f32,
+    saturation: f32,
+    grayscale: bool,
+    is_cropped: bool,
+    crop_x0: f32,
+    crop_y0: f32,
+    crop_x1: f32,
+    crop_y1: f32,
+    custom_resize: bool,
+    target_width: u32,
+    target_height: u32,
 }
 
 #[derive(Clone, PartialEq)]
@@ -203,16 +247,53 @@ impl PhotoEditor {
 
         self.path = Some(path);
         self.file_size = file_size;
-        self.original = Some(img);
+        self.original = Some(Arc::new(img));
         self.preview_base = Some(preview);
         self.preview_texture = None;
         self.format = format;
         self.reset_edits();
         self.target_width = w;
         self.target_height = h;
+        self.save_dialog = None;
         self.history.clear();
         self.frame_snapshot = None;
         Ok(())
+    }
+
+    fn rotate_ccw(&mut self) {
+        self.rotation_steps = (self.rotation_steps + 3) % 4;
+        if self.custom_resize {
+            std::mem::swap(&mut self.target_width, &mut self.target_height);
+        }
+        self.dirty = true;
+    }
+
+    fn rotate_cw(&mut self) {
+        self.rotation_steps = (self.rotation_steps + 1) % 4;
+        if self.custom_resize {
+            std::mem::swap(&mut self.target_width, &mut self.target_height);
+        }
+        self.dirty = true;
+    }
+
+    fn transform_params(&self) -> PhotoTransformParams {
+        PhotoTransformParams {
+            rotation_steps: self.rotation_steps,
+            flip_h: self.flip_h,
+            flip_v: self.flip_v,
+            brightness: self.brightness,
+            contrast: self.contrast,
+            saturation: self.saturation,
+            grayscale: self.grayscale,
+            is_cropped: self.is_cropped(),
+            crop_x0: self.crop_x0,
+            crop_y0: self.crop_y0,
+            crop_x1: self.crop_x1,
+            crop_y1: self.crop_y1,
+            custom_resize: self.custom_resize,
+            target_width: self.target_width,
+            target_height: self.target_height,
+        }
     }
 
     pub fn snapshot(&self) -> PhotoSnapshot {
@@ -297,34 +378,39 @@ impl PhotoEditor {
         if ctx.wants_keyboard_input() {
             return;
         }
-        ctx.input(|i| {
+        let (rot_l, rot_r, fh, fv, crop, esc_enter) = ctx.input(|i| {
             let no_mods = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
-            if no_mods && i.key_pressed(egui::Key::L) {
-                self.rotation_steps = (self.rotation_steps + 3) % 4;
-                self.dirty = true;
-            }
-            if no_mods && i.key_pressed(egui::Key::R) {
-                self.rotation_steps = (self.rotation_steps + 1) % 4;
-                self.dirty = true;
-            }
-            if no_mods && i.key_pressed(egui::Key::H) {
-                self.flip_h = !self.flip_h;
-                self.dirty = true;
-            }
-            if no_mods && i.key_pressed(egui::Key::V) {
-                self.flip_v = !self.flip_v;
-                self.dirty = true;
-            }
-            if no_mods && i.key_pressed(egui::Key::C) {
-                self.crop_mode = !self.crop_mode;
-                self.dirty = true;
-            }
-            if self.crop_mode && (i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape))
-            {
-                self.crop_mode = false;
-                self.dirty = true;
-            }
+            (
+                no_mods && i.key_pressed(egui::Key::L),
+                no_mods && i.key_pressed(egui::Key::R),
+                no_mods && i.key_pressed(egui::Key::H),
+                no_mods && i.key_pressed(egui::Key::V),
+                no_mods && i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape),
+            )
         });
+        if rot_l {
+            self.rotate_ccw();
+        }
+        if rot_r {
+            self.rotate_cw();
+        }
+        if fh {
+            self.flip_h = !self.flip_h;
+            self.dirty = true;
+        }
+        if fv {
+            self.flip_v = !self.flip_v;
+            self.dirty = true;
+        }
+        if crop {
+            self.crop_mode = !self.crop_mode;
+            self.dirty = true;
+        }
+        if self.crop_mode && esc_enter {
+            self.crop_mode = false;
+            self.dirty = true;
+        }
     }
 
     pub fn request_save(&mut self, ctx: &egui::Context) {
@@ -391,6 +477,9 @@ impl PhotoEditor {
         self.crop_mode = false;
         self.active_drag = CropDrag::None;
         self.drag_aspect_ratio = None;
+        self.save_dialog = None;
+        self.history.clear();
+        self.frame_snapshot = None;
     }
 
     fn is_cropped(&self) -> bool {
@@ -440,89 +529,6 @@ impl PhotoEditor {
         self.crop_y1 = self.crop_y0 + dy;
     }
 
-    fn apply_transforms(
-        &self,
-        src: &DynamicImage,
-        apply_crop: bool,
-        apply_resize: bool,
-        is_preview: bool,
-    ) -> DynamicImage {
-        let mut img = match self.rotation_steps % 4 {
-            1 => src.rotate90(),
-            2 => src.rotate180(),
-            3 => src.rotate270(),
-            _ => src.clone(),
-        };
-
-        if self.flip_h {
-            img = img.fliph();
-        }
-        if self.flip_v {
-            img = img.flipv();
-        }
-
-        if apply_crop && self.is_cropped() {
-            let (w, h) = img.dimensions();
-            let x = ((w as f32) * self.crop_x0).round() as u32;
-            let y = ((h as f32) * self.crop_y0).round() as u32;
-            let cw = ((w as f32) * (self.crop_x1 - self.crop_x0)).round() as u32;
-            let ch = ((h as f32) * (self.crop_y1 - self.crop_y0)).round() as u32;
-            let x = x.min(w.saturating_sub(1));
-            let y = y.min(h.saturating_sub(1));
-            let cw = cw.min(w - x).max(1);
-            let ch = ch.min(h - y).max(1);
-            img = img.crop_imm(x, y, cw, ch);
-        }
-
-        if self.brightness != 0 {
-            img = img.brighten(self.brightness);
-        }
-        if self.contrast.abs() > 0.5 {
-            img = img.adjust_contrast(self.contrast);
-        }
-
-        if self.grayscale {
-            img = img.grayscale();
-        } else if (self.saturation - 1.0).abs() > 0.01 {
-            let mut rgba: RgbaImage = img.to_rgba8();
-            let sat = self.saturation;
-            for p in rgba.pixels_mut() {
-                let r = p[0] as f32;
-                let g = p[1] as f32;
-                let b = p[2] as f32;
-                let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-                p[0] = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
-                p[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
-                p[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
-            }
-            img = DynamicImage::ImageRgba8(rgba);
-        }
-
-        if apply_resize && self.custom_resize && self.target_width > 0 && self.target_height > 0 {
-            if is_preview {
-                let (pw, ph) = if self.target_width <= 1000 && self.target_height <= 1000 {
-                    (self.target_width, self.target_height)
-                } else {
-                    let k = (1000.0 / self.target_width as f32)
-                        .min(1000.0 / self.target_height as f32);
-                    (
-                        ((self.target_width as f32 * k).round() as u32).max(1),
-                        ((self.target_height as f32 * k).round() as u32).max(1),
-                    )
-                };
-                img = img.resize_exact(pw, ph, image::imageops::FilterType::Triangle);
-            } else {
-                img = img.resize_exact(
-                    self.target_width,
-                    self.target_height,
-                    image::imageops::FilterType::Lanczos3,
-                );
-            }
-        }
-
-        img
-    }
-
     fn rebuild_preview(&mut self, ctx: &egui::Context) {
         if !self.dirty {
             return;
@@ -534,7 +540,8 @@ impl PhotoEditor {
 
         // In crop mode show the full image so user can adjust the frame freely;
         // outside crop mode show the already-cropped & resized result cleanly!
-        let processed = self.apply_transforms(base, !self.crop_mode, !self.crop_mode, true);
+        let params = self.transform_params();
+        let processed = apply_photo_pipeline(base, &params, !self.crop_mode, !self.crop_mode, true);
         let rgba = processed.to_rgba8();
         let size = [rgba.width() as usize, rgba.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -543,35 +550,6 @@ impl PhotoEditor {
             color_image,
             TextureOptions::LINEAR,
         ));
-    }
-
-    pub fn export(&self, out_path: &Path) -> Result<(), String> {
-        let orig = self
-            .original
-            .as_ref()
-            .ok_or_else(|| "Фото не загружено".to_string())?;
-        let processed = self.apply_transforms(orig, true, true, false);
-
-        match self.format {
-            PhotoFormat::Png => processed
-                .save_with_format(out_path, ImageFormat::Png)
-                .map_err(|e| format!("Ошибка сохранения PNG: {}", e)),
-            PhotoFormat::Jpeg => {
-                let rgb = processed.to_rgb8();
-                let mut file = std::fs::File::create(out_path)
-                    .map_err(|e| format!("Не удалось создать файл: {}", e))?;
-                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                    &mut file,
-                    self.jpeg_quality,
-                );
-                encoder
-                    .encode_image(&rgb)
-                    .map_err(|e| format!("Ошибка сохранения JPEG: {}", e))
-            }
-            PhotoFormat::Webp => processed
-                .save_with_format(out_path, ImageFormat::WebP)
-                .map_err(|e| format!("Ошибка сохранения WEBP: {}", e)),
-        }
     }
 
     fn hit_test_crop(pos: Pos2, crop_rect: Rect) -> CropDrag {
@@ -628,7 +606,7 @@ impl PhotoEditor {
         CropDrag::None
     }
 
-    fn handle_crop_interaction(&mut self, ui: &mut egui::Ui, img_rect: Rect) {
+    fn handle_crop_interaction(&mut self, ui: &mut egui::Ui, canvas_rect: Rect, img_rect: Rect) {
         let min_size = 0.05_f32;
         let img_w = img_rect.width().max(1.0);
         let img_h = img_rect.height().max(1.0);
@@ -646,7 +624,7 @@ impl PhotoEditor {
         );
 
         let resp = ui.interact(
-            img_rect.expand(16.0),
+            canvas_rect,
             ui.id().with("interactive_crop"),
             egui::Sense::click_and_drag(),
         );
@@ -694,12 +672,13 @@ impl PhotoEditor {
             }
         }
 
-        // Single click outside the crop frame automatically applies and closes framing mode
+        // Single click anywhere outside the crop frame applies and closes framing immediately
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if !crop_rect.expand(12.0).contains(pos) {
                     self.crop_mode = false;
                     self.dirty = true;
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -721,90 +700,100 @@ impl PhotoEditor {
 
             match self.active_drag {
                 CropDrag::Move => {
-                    let w = self.crop_x1 - self.crop_x0;
-                    let h = self.crop_y1 - self.crop_y0;
-                    let nx0 = (self.crop_x0 + dx).clamp(0.0, 1.0 - w);
-                    let ny0 = (self.crop_y0 + dy).clamp(0.0, 1.0 - h);
+                    let w = (self.crop_x1 - self.crop_x0).clamp(0.0, 1.0);
+                    let h = (self.crop_y1 - self.crop_y0).clamp(0.0, 1.0);
+                    let nx0 = (self.crop_x0 + dx).clamp(0.0, (1.0 - w).max(0.0));
+                    let ny0 = (self.crop_y0 + dy).clamp(0.0, (1.0 - h).max(0.0));
                     self.crop_x0 = nx0;
-                    self.crop_x1 = nx0 + w;
+                    self.crop_x1 = (nx0 + w).min(1.0);
                     self.crop_y0 = ny0;
-                    self.crop_y1 = ny0 + h;
+                    self.crop_y1 = (ny0 + h).min(1.0);
                 }
                 drag => {
                     let locked_ratio = self.crop_aspect.ratio().or(self.drag_aspect_ratio);
                     if let Some(target_ratio) = locked_ratio {
-                        // Aspect-locked resize from corners or edges
-                        // Normalized relation: (w * img_aspect) / h = target_ratio => h = w * (img_aspect / target_ratio)
-                        let k = img_aspect / target_ratio;
+                        let k = (img_aspect / target_ratio).max(0.05);
                         match drag {
                             CropDrag::BottomRight | CropDrag::Right | CropDrag::Bottom => {
                                 let mut w = (self.crop_x1 - self.crop_x0 + dx).max(min_size);
                                 if drag == CropDrag::Bottom {
                                     let h = (self.crop_y1 - self.crop_y0 + dy).max(min_size);
-                                    w = (h / k).max(min_size);
+                                    w = h / k;
                                 }
-                                let max_w = (1.0 - self.crop_x0).min((1.0 - self.crop_y0) / k);
-                                w = w.min(max_w).max(min_size);
-                                self.crop_x1 = self.crop_x0 + w;
-                                self.crop_y1 = self.crop_y0 + w * k;
+                                let max_w = (1.0 - self.crop_x0)
+                                    .min((1.0 - self.crop_y0) / k)
+                                    .max(0.01);
+                                let min_w = min_size.min(max_w);
+                                w = w.clamp(min_w, max_w);
+                                self.crop_x1 = (self.crop_x0 + w).min(1.0);
+                                self.crop_y1 = (self.crop_y0 + w * k).min(1.0);
                             }
                             CropDrag::TopLeft | CropDrag::Left | CropDrag::Top => {
                                 let mut w = (self.crop_x1 - self.crop_x0 - dx).max(min_size);
                                 if drag == CropDrag::Top {
                                     let h = (self.crop_y1 - self.crop_y0 - dy).max(min_size);
-                                    w = (h / k).max(min_size);
+                                    w = h / k;
                                 }
-                                let max_w = self.crop_x1.min(self.crop_y1 / k);
-                                w = w.min(max_w).max(min_size);
-                                self.crop_x0 = self.crop_x1 - w;
-                                self.crop_y0 = self.crop_y1 - w * k;
+                                let max_w = self.crop_x1.min(self.crop_y1 / k).max(0.01);
+                                let min_w = min_size.min(max_w);
+                                w = w.clamp(min_w, max_w);
+                                self.crop_x0 = (self.crop_x1 - w).max(0.0);
+                                self.crop_y0 = (self.crop_y1 - w * k).max(0.0);
                             }
                             CropDrag::TopRight => {
-                                let mut w = (self.crop_x1 - self.crop_x0 + dx).max(min_size);
-                                let max_w = (1.0 - self.crop_x0).min(self.crop_y1 / k);
-                                w = w.min(max_w).max(min_size);
-                                self.crop_x1 = self.crop_x0 + w;
-                                self.crop_y0 = self.crop_y1 - w * k;
+                                let w_raw = (self.crop_x1 - self.crop_x0 + dx).max(min_size);
+                                let max_w =
+                                    (1.0 - self.crop_x0).min(self.crop_y1 / k).max(0.01);
+                                let min_w = min_size.min(max_w);
+                                let w = w_raw.clamp(min_w, max_w);
+                                self.crop_x1 = (self.crop_x0 + w).min(1.0);
+                                self.crop_y0 = (self.crop_y1 - w * k).max(0.0);
                             }
                             CropDrag::BottomLeft => {
-                                let mut w = (self.crop_x1 - self.crop_x0 - dx).max(min_size);
-                                let max_w = self.crop_x1.min((1.0 - self.crop_y0) / k);
-                                w = w.min(max_w).max(min_size);
-                                self.crop_x0 = self.crop_x1 - w;
-                                self.crop_y1 = self.crop_y0 + w * k;
+                                let w_raw = (self.crop_x1 - self.crop_x0 - dx).max(min_size);
+                                let max_w =
+                                    self.crop_x1.min((1.0 - self.crop_y0) / k).max(0.01);
+                                let min_w = min_size.min(max_w);
+                                let w = w_raw.clamp(min_w, max_w);
+                                self.crop_x0 = (self.crop_x1 - w).max(0.0);
+                                self.crop_y1 = (self.crop_y0 + w * k).min(1.0);
                             }
                             _ => {}
                         }
                     } else {
-                        // Free aspect resize
+                        // Free aspect resize (safe clamp upper/lower bounds)
+                        let max_x0 = (self.crop_x1 - min_size).max(0.0);
+                        let min_x1 = (self.crop_x0 + min_size).min(1.0);
+                        let max_y0 = (self.crop_y1 - min_size).max(0.0);
+                        let min_y1 = (self.crop_y0 + min_size).min(1.0);
                         match drag {
                             CropDrag::TopLeft => {
-                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, self.crop_x1 - min_size);
-                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, self.crop_y1 - min_size);
+                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, max_x0);
+                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, max_y0);
                             }
                             CropDrag::TopRight => {
-                                self.crop_x1 = (self.crop_x1 + dx).clamp(self.crop_x0 + min_size, 1.0);
-                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, self.crop_y1 - min_size);
+                                self.crop_x1 = (self.crop_x1 + dx).clamp(min_x1, 1.0);
+                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, max_y0);
                             }
                             CropDrag::BottomLeft => {
-                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, self.crop_x1 - min_size);
-                                self.crop_y1 = (self.crop_y1 + dy).clamp(self.crop_y0 + min_size, 1.0);
+                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, max_x0);
+                                self.crop_y1 = (self.crop_y1 + dy).clamp(min_y1, 1.0);
                             }
                             CropDrag::BottomRight => {
-                                self.crop_x1 = (self.crop_x1 + dx).clamp(self.crop_x0 + min_size, 1.0);
-                                self.crop_y1 = (self.crop_y1 + dy).clamp(self.crop_y0 + min_size, 1.0);
+                                self.crop_x1 = (self.crop_x1 + dx).clamp(min_x1, 1.0);
+                                self.crop_y1 = (self.crop_y1 + dy).clamp(min_y1, 1.0);
                             }
                             CropDrag::Left => {
-                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, self.crop_x1 - min_size);
+                                self.crop_x0 = (self.crop_x0 + dx).clamp(0.0, max_x0);
                             }
                             CropDrag::Right => {
-                                self.crop_x1 = (self.crop_x1 + dx).clamp(self.crop_x0 + min_size, 1.0);
+                                self.crop_x1 = (self.crop_x1 + dx).clamp(min_x1, 1.0);
                             }
                             CropDrag::Top => {
-                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, self.crop_y1 - min_size);
+                                self.crop_y0 = (self.crop_y0 + dy).clamp(0.0, max_y0);
                             }
                             CropDrag::Bottom => {
-                                self.crop_y1 = (self.crop_y1 + dy).clamp(self.crop_y0 + min_size, 1.0);
+                                self.crop_y1 = (self.crop_y1 + dy).clamp(min_y1, 1.0);
                             }
                             _ => {}
                         }
@@ -908,6 +897,7 @@ impl PhotoEditor {
 
         // Top metadata bar
         let compact_bar = ui.available_width() < 420.0;
+        let mut closed = false;
         ui.horizontal_wrapped(|ui| {
             if let Some(p) = &self.path {
                 let full_name = p
@@ -932,10 +922,10 @@ impl PhotoEditor {
                     .clicked()
                 {
                     self.clear();
-                    return;
+                    closed = true;
                 }
             }
-            if self.crop_mode {
+            if !closed && self.crop_mode {
                 ui.label(
                     egui::RichText::new(
                         "Тяни углы (Shift — пропорционально), клик мимо — применить",
@@ -944,7 +934,7 @@ impl PhotoEditor {
                     .color(theme::ACCENT),
                 );
             }
-            if ui.max_rect().right() - ui.cursor().left() >= 165.0 {
+            if !closed && ui.max_rect().right() - ui.cursor().left() >= 165.0 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     theme::metadata_pill(ui, &theme::format_bytes(self.file_size));
                     let out_dims = if self.custom_resize {
@@ -957,7 +947,7 @@ impl PhotoEditor {
             }
         });
 
-        if !self.has_file() {
+        if closed || !self.has_file() {
             return;
         }
 
@@ -1016,16 +1006,52 @@ impl PhotoEditor {
                         );
 
                         if self.crop_mode {
-                            self.handle_crop_interaction(ui, img_rect);
+                            self.handle_crop_interaction(ui, rect, img_rect);
                         }
                     }
                 }
             });
     }
 
-    /// Renders right-side inspector controls. Returns `Some(path)` if user requests saving.
-    pub fn render_inspector(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
-        let mut save_target = None;
+    fn apply_width_with_aspect(&mut self, w: u32, aspect: f32) {
+        let w = w.clamp(16, 8000);
+        self.target_width = w;
+        if self.lock_aspect {
+            let aspect = aspect.max(0.01);
+            let h_f = (w as f32 / aspect).round();
+            if h_f > 8000.0 {
+                self.target_height = 8000;
+                self.target_width = ((8000.0 * aspect).round() as u32).clamp(16, 8000);
+            } else if h_f < 16.0 {
+                self.target_height = 16;
+                self.target_width = ((16.0 * aspect).round() as u32).clamp(16, 8000);
+            } else {
+                self.target_height = h_f as u32;
+            }
+        }
+    }
+
+    fn apply_height_with_aspect(&mut self, h: u32, aspect: f32) {
+        let h = h.clamp(16, 8000);
+        self.target_height = h;
+        if self.lock_aspect {
+            let aspect = aspect.max(0.01);
+            let w_f = (h as f32 * aspect).round();
+            if w_f > 8000.0 {
+                self.target_width = 8000;
+                self.target_height = ((8000.0 / aspect).round() as u32).clamp(16, 8000);
+            } else if w_f < 16.0 {
+                self.target_width = 16;
+                self.target_height = ((16.0 / aspect).round() as u32).clamp(16, 8000);
+            } else {
+                self.target_width = w_f as u32;
+            }
+        }
+    }
+
+    /// Renders right-side inspector controls. Returns `Some(PhotoExportJob)` when user chooses save path.
+    pub fn render_inspector(&mut self, ui: &mut egui::Ui, is_busy: bool) -> Option<PhotoExportJob> {
+        let mut job = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1043,10 +1069,10 @@ impl PhotoEditor {
                             self.crop_mode = !self.crop_mode;
                             self.dirty = true;
                         }
-                        if self.is_cropped() || self.crop_mode {
-                            if theme::subtle_button(ui, "Сбросить").clicked() {
-                                self.reset_crop();
-                            }
+                        if (self.is_cropped() || self.crop_mode)
+                            && theme::subtle_button(ui, "Сбросить").clicked()
+                        {
+                            self.reset_crop();
                         }
                     });
 
@@ -1092,8 +1118,7 @@ impl PhotoEditor {
                                 )
                                 .clicked()
                             {
-                                self.rotation_steps = (self.rotation_steps + 3) % 4;
-                                self.dirty = true;
+                                self.rotate_ccw();
                             }
                             if ui
                                 .add_sized(
@@ -1105,8 +1130,7 @@ impl PhotoEditor {
                                 )
                                 .clicked()
                             {
-                                self.rotation_steps = (self.rotation_steps + 1) % 4;
-                                self.dirty = true;
+                                self.rotate_cw();
                             }
                         });
                         ui.add_space(4.0);
@@ -1223,11 +1247,7 @@ impl PhotoEditor {
                                 )
                                 .changed()
                             {
-                                if self.lock_aspect {
-                                    self.target_height =
-                                        ((self.target_width as f32) / aspect).round().max(1.0)
-                                            as u32;
-                                }
+                                self.apply_width_with_aspect(self.target_width, aspect);
                                 self.crop_mode = false;
                                 self.dirty = true;
                             }
@@ -1242,17 +1262,13 @@ impl PhotoEditor {
                                 )
                                 .changed()
                             {
-                                if self.lock_aspect {
-                                    self.target_width =
-                                        ((self.target_height as f32) * aspect).round().max(1.0)
-                                            as u32;
-                                }
+                                self.apply_height_with_aspect(self.target_height, aspect);
                                 self.crop_mode = false;
                                 self.dirty = true;
                             }
                         });
                         ui.add_space(6.0);
-                        ui.scope(|ui| {
+                        ui.add_enabled_ui(self.lock_aspect, |ui| {
                             ui.spacing_mut().slider_width =
                                 (ui.available_width() - 66.0).max(110.0);
                             ui.spacing_mut().interact_size.x = 56.0;
@@ -1271,13 +1287,12 @@ impl PhotoEditor {
                                         .suffix("%")
                                         .fixed_decimals(0),
                                 )
+                                .on_disabled_hover_text("Включи «Сохранять пропорции»")
                                 .changed()
                             {
                                 let k = scale_pct / 100.0;
-                                self.target_width =
-                                    ((eff_w as f32 * k).round() as u32).clamp(16, 8000);
-                                self.target_height =
-                                    ((eff_h as f32 * k).round() as u32).clamp(16, 8000);
+                                let raw_w = (eff_w as f32 * k).round() as u32;
+                                self.apply_width_with_aspect(raw_w, aspect);
                                 self.crop_mode = false;
                                 self.dirty = true;
                             }
@@ -1286,8 +1301,7 @@ impl PhotoEditor {
                         if ui.checkbox(&mut self.lock_aspect, "Сохранять пропорции").changed()
                             && self.lock_aspect
                         {
-                            self.target_height =
-                                ((self.target_width as f32) / aspect).round().max(1.0) as u32;
+                            self.apply_width_with_aspect(self.target_width, aspect);
                             self.dirty = true;
                         }
                     }
@@ -1332,16 +1346,454 @@ impl PhotoEditor {
 
         if let Some(picked) = self.save_dialog.as_ref().and_then(|d| d.poll()) {
             self.save_dialog = None;
-            if let Some(p) = picked {
-                save_target = Some(p);
+            if let (Some(orig), Some(output)) = (self.original.as_ref(), picked) {
+                job = Some(PhotoExportJob {
+                    original: Arc::clone(orig),
+                    output,
+                    rotation_steps: self.rotation_steps,
+                    flip_h: self.flip_h,
+                    flip_v: self.flip_v,
+                    brightness: self.brightness,
+                    contrast: self.contrast,
+                    saturation: self.saturation,
+                    grayscale: self.grayscale,
+                    is_cropped: self.is_cropped(),
+                    crop_x0: self.crop_x0,
+                    crop_y0: self.crop_y0,
+                    crop_x1: self.crop_x1,
+                    crop_y1: self.crop_y1,
+                    custom_resize: self.custom_resize,
+                    target_width: self.target_width,
+                    target_height: self.target_height,
+                    format: self.format,
+                    jpeg_quality: self.jpeg_quality,
+                });
             }
         }
 
         ui.add_space(8.0);
-        if theme::accent_button(ui, "Сохранить фото").clicked() {
-            self.request_save(ui.ctx());
+        let btn_text = if is_busy {
+            "Сохранение фото..."
+        } else {
+            "Сохранить фото"
+        };
+        ui.add_enabled_ui(!is_busy && self.save_dialog.is_none(), |ui| {
+            if theme::accent_button(ui, btn_text).clicked() {
+                self.request_save(ui.ctx());
+            }
+        });
+
+        job
+    }
+}
+
+fn apply_color_filters(
+    img: DynamicImage,
+    brightness: i32,
+    contrast: f32,
+    saturation: f32,
+    grayscale: bool,
+) -> DynamicImage {
+    let has_brightness = brightness != 0;
+    let has_contrast = contrast.abs() > 0.5;
+    let has_sat = (saturation - 1.0).abs() > 0.01;
+    if !has_brightness && !has_contrast && !grayscale && !has_sat {
+        return img;
+    }
+
+    let mut rgba = img.into_rgba8();
+    let c_pow = if has_contrast {
+        ((100.0 + contrast) / 100.0).powi(2)
+    } else {
+        1.0
+    };
+    let b_add = brightness as f32;
+
+    for p in rgba.pixels_mut() {
+        let mut r = p[0] as f32;
+        let mut g = p[1] as f32;
+        let mut b = p[2] as f32;
+
+        if has_brightness {
+            r = (r + b_add).clamp(0.0, 255.0);
+            g = (g + b_add).clamp(0.0, 255.0);
+            b = (b + b_add).clamp(0.0, 255.0);
+        }
+        if has_contrast {
+            r = (((r / 255.0 - 0.5) * c_pow + 0.5) * 255.0).clamp(0.0, 255.0);
+            g = (((g / 255.0 - 0.5) * c_pow + 0.5) * 255.0).clamp(0.0, 255.0);
+            b = (((b / 255.0 - 0.5) * c_pow + 0.5) * 255.0).clamp(0.0, 255.0);
+        }
+        if grayscale {
+            let luma = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0);
+            r = luma;
+            g = luma;
+            b = luma;
+        } else if has_sat {
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            r = (luma + (r - luma) * saturation).clamp(0.0, 255.0);
+            g = (luma + (g - luma) * saturation).clamp(0.0, 255.0);
+            b = (luma + (b - luma) * saturation).clamp(0.0, 255.0);
         }
 
-        save_target
+        p[0] = r as u8;
+        p[1] = g as u8;
+        p[2] = b as u8;
+    }
+
+    DynamicImage::ImageRgba8(rgba)
+}
+
+fn apply_photo_pipeline(
+    src: &DynamicImage,
+    params: &PhotoTransformParams,
+    apply_crop: bool,
+    apply_resize: bool,
+    is_preview: bool,
+) -> DynamicImage {
+    let rot = params.rotation_steps % 4;
+    let will_crop = apply_crop && params.is_cropped;
+
+    // Avoid cloning full-res image when unrotated/unflipped and cropping or downscaling directly
+    let mut img = if rot == 0 && !params.flip_h && !params.flip_v {
+        if will_crop {
+            let (w, h) = src.dimensions();
+            let x = (((w as f32) * params.crop_x0).round() as u32).min(w.saturating_sub(1));
+            let y = (((h as f32) * params.crop_y0).round() as u32).min(h.saturating_sub(1));
+            let cw = (((w as f32) * (params.crop_x1 - params.crop_x0)).round() as u32)
+                .min(w - x)
+                .max(1);
+            let ch = (((h as f32) * (params.crop_y1 - params.crop_y0)).round() as u32)
+                .min(h - y)
+                .max(1);
+            src.crop_imm(x, y, cw, ch)
+        } else {
+            src.clone()
+        }
+    } else {
+        let mut t = if rot == 0 {
+            if params.flip_h {
+                let f = src.fliph();
+                if params.flip_v { f.flipv() } else { f }
+            } else {
+                src.flipv()
+            }
+        } else {
+            let mut r = match rot {
+                1 => src.rotate90(),
+                2 => src.rotate180(),
+                _ => src.rotate270(),
+            };
+            if params.flip_h {
+                r = r.fliph();
+            }
+            if params.flip_v {
+                r = r.flipv();
+            }
+            r
+        };
+        if will_crop {
+            let (w, h) = t.dimensions();
+            let x = (((w as f32) * params.crop_x0).round() as u32).min(w.saturating_sub(1));
+            let y = (((h as f32) * params.crop_y0).round() as u32).min(h.saturating_sub(1));
+            let cw = (((w as f32) * (params.crop_x1 - params.crop_x0)).round() as u32)
+                .min(w - x)
+                .max(1);
+            let ch = (((h as f32) * (params.crop_y1 - params.crop_y0)).round() as u32)
+                .min(h - y)
+                .max(1);
+            t = t.crop_imm(x, y, cw, ch);
+        }
+        t
+    };
+
+    let want_resize =
+        apply_resize && params.custom_resize && params.target_width > 0 && params.target_height > 0;
+    let resize_dims = if want_resize {
+        if is_preview {
+            if params.target_width <= 1000 && params.target_height <= 1000 {
+                Some((params.target_width, params.target_height))
+            } else {
+                let k = (1000.0 / params.target_width as f32)
+                    .min(1000.0 / params.target_height as f32);
+                Some((
+                    ((params.target_width as f32 * k).round() as u32).max(1),
+                    ((params.target_height as f32 * k).round() as u32).max(1),
+                ))
+            }
+        } else {
+            Some((params.target_width, params.target_height))
+        }
+    } else {
+        None
+    };
+
+    // Downscale BEFORE running per-pixel color adjustments for huge speedup on large photos
+    let (cur_w, cur_h) = img.dimensions();
+    let downscale_early = resize_dims
+        .map(|(rw, rh)| (rw as u64 * rh as u64) < (cur_w as u64 * cur_h as u64))
+        .unwrap_or(false);
+
+    if downscale_early {
+        if let Some((rw, rh)) = resize_dims {
+            let filter = if is_preview {
+                image::imageops::FilterType::Triangle
+            } else {
+                image::imageops::FilterType::Lanczos3
+            };
+            img = img.resize_exact(rw, rh, filter);
+        }
+    }
+
+    img = apply_color_filters(
+        img,
+        params.brightness,
+        params.contrast,
+        params.saturation,
+        params.grayscale,
+    );
+
+    if !downscale_early {
+        if let Some((rw, rh)) = resize_dims {
+            let filter = if is_preview {
+                image::imageops::FilterType::Triangle
+            } else {
+                image::imageops::FilterType::Lanczos3
+            };
+            img = img.resize_exact(rw, rh, filter);
+        }
+    }
+
+    img
+}
+
+pub fn run_photo_export(job: &PhotoExportJob) -> Result<PathBuf, String> {
+    let params = PhotoTransformParams {
+        rotation_steps: job.rotation_steps,
+        flip_h: job.flip_h,
+        flip_v: job.flip_v,
+        brightness: job.brightness,
+        contrast: job.contrast,
+        saturation: job.saturation,
+        grayscale: job.grayscale,
+        is_cropped: job.is_cropped,
+        crop_x0: job.crop_x0,
+        crop_y0: job.crop_y0,
+        crop_x1: job.crop_x1,
+        crop_y1: job.crop_y1,
+        custom_resize: job.custom_resize,
+        target_width: job.target_width,
+        target_height: job.target_height,
+    };
+    let processed = apply_photo_pipeline(&job.original, &params, true, true, false);
+
+    let tmp_path = crate::media::temp_output_path(&job.output);
+    let encode_res: Result<(), String> = (|| {
+        match job.format {
+            PhotoFormat::Png => {
+                let file = std::fs::File::create(&tmp_path)
+                    .map_err(|e| format!("Не удалось создать файл: {}", e))?;
+                let writer = BufWriter::with_capacity(64 * 1024, file);
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    writer,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::Adaptive,
+                );
+                let rgba = processed.to_rgba8();
+                encoder
+                    .write_image(
+                        rgba.as_raw(),
+                        rgba.width(),
+                        rgba.height(),
+                        ExtendedColorType::Rgba8,
+                    )
+                    .map_err(|e| format!("Ошибка сохранения PNG: {}", e))
+            }
+            PhotoFormat::Jpeg => {
+                let rgb = processed.to_rgb8();
+                let file = std::fs::File::create(&tmp_path)
+                    .map_err(|e| format!("Не удалось создать файл: {}", e))?;
+                let mut writer = BufWriter::with_capacity(64 * 1024, file);
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    &mut writer,
+                    job.jpeg_quality,
+                );
+                encoder
+                    .encode_image(&rgb)
+                    .map_err(|e| format!("Ошибка сохранения JPEG: {}", e))?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("Ошибка записи JPEG: {}", e))
+            }
+            PhotoFormat::Webp => processed
+                .save_with_format(&tmp_path, ImageFormat::WebP)
+                .map_err(|e| format!("Ошибка сохранения WEBP: {}", e)),
+        }
+    })();
+
+    if let Err(e) = encode_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    crate::media::finalize_temp_replace(&tmp_path, &job.output)?;
+    Ok(job.output.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+
+    fn make_test_image(w: u32, h: u32) -> DynamicImage {
+        let mut rgba = RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x * 37 + y * 13) % 256) as u8;
+                let g = ((x * 17 + y * 53) % 256) as u8;
+                let b = ((x * 29 + y * 7) % 256) as u8;
+                rgba.put_pixel(x, y, Rgba([r, g, b, 255]));
+            }
+        }
+        DynamicImage::ImageRgba8(rgba)
+    }
+
+    fn base_params() -> PhotoTransformParams {
+        PhotoTransformParams {
+            rotation_steps: 0,
+            flip_h: false,
+            flip_v: false,
+            brightness: 0,
+            contrast: 0.0,
+            saturation: 1.0,
+            grayscale: false,
+            is_cropped: false,
+            crop_x0: 0.0,
+            crop_y0: 0.0,
+            crop_x1: 1.0,
+            crop_y1: 1.0,
+            custom_resize: false,
+            target_width: 0,
+            target_height: 0,
+        }
+    }
+
+    #[test]
+    fn pipeline_handles_rotations_and_flips_without_panic() {
+        let img = make_test_image(8, 6);
+
+        let mut p = base_params();
+        p.flip_h = true;
+        let out_h = apply_photo_pipeline(&img, &p, true, true, false);
+        assert_eq!(out_h.dimensions(), (8, 6));
+        assert_eq!(
+            out_h.to_rgba8().get_pixel(0, 0),
+            img.to_rgba8().get_pixel(7, 0)
+        );
+
+        let mut p = base_params();
+        p.flip_v = true;
+        let out_v = apply_photo_pipeline(&img, &p, true, true, false);
+        assert_eq!(out_v.dimensions(), (8, 6));
+        assert_eq!(
+            out_v.to_rgba8().get_pixel(0, 0),
+            img.to_rgba8().get_pixel(0, 5)
+        );
+
+        let mut p = base_params();
+        p.flip_h = true;
+        p.flip_v = true;
+        let out_hv = apply_photo_pipeline(&img, &p, true, true, false);
+        assert_eq!(out_hv.dimensions(), (8, 6));
+        assert_eq!(
+            out_hv.to_rgba8().get_pixel(0, 0),
+            img.to_rgba8().get_pixel(7, 5)
+        );
+
+        for rot in 1..=3 {
+            let mut p = base_params();
+            p.rotation_steps = rot;
+            let out_r = apply_photo_pipeline(&img, &p, true, true, false);
+            let expected = if rot % 2 == 1 { (6, 8) } else { (8, 6) };
+            assert_eq!(out_r.dimensions(), expected);
+        }
+    }
+
+    #[test]
+    fn pipeline_crop_resize_and_color_filters() {
+        let img = make_test_image(20, 12);
+        let mut p = base_params();
+        p.is_cropped = true;
+        p.crop_x0 = 0.25;
+        p.crop_y0 = 0.25;
+        p.crop_x1 = 0.75;
+        p.crop_y1 = 0.75;
+        p.custom_resize = true;
+        p.target_width = 16;
+        p.target_height = 16;
+        p.brightness = 10;
+        p.contrast = 15.0;
+        p.saturation = 1.2;
+        p.grayscale = true;
+
+        let out = apply_photo_pipeline(&img, &p, true, true, false);
+        assert_eq!(out.dimensions(), (16, 16));
+        let px = out.to_rgba8();
+        let center = px.get_pixel(8, 8);
+        assert_eq!(center[0], center[1]);
+        assert_eq!(center[1], center[2]);
+    }
+
+    #[test]
+    fn export_writes_png_jpeg_webp_and_overwrites_in_place() {
+        let dir = std::env::temp_dir().join(format!("kadr_photo_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+
+        let img = Arc::new(make_test_image(24, 18));
+        let formats = [
+            (PhotoFormat::Png, "out.png"),
+            (PhotoFormat::Jpeg, "out.jpg"),
+            (PhotoFormat::Webp, "out.webp"),
+        ];
+
+        for (fmt, name) in formats {
+            let out_path = dir.join(name);
+            let job = PhotoExportJob {
+                original: Arc::clone(&img),
+                output: out_path.clone(),
+                rotation_steps: 0,
+                flip_h: true,
+                flip_v: false,
+                brightness: 5,
+                contrast: 0.0,
+                saturation: 1.0,
+                grayscale: false,
+                is_cropped: false,
+                crop_x0: 0.0,
+                crop_y0: 0.0,
+                crop_x1: 1.0,
+                crop_y1: 1.0,
+                custom_resize: false,
+                target_width: 24,
+                target_height: 18,
+                format: fmt,
+                jpeg_quality: 85,
+            };
+
+            let saved = run_photo_export(&job).expect("initial export should succeed");
+            assert_eq!(saved, out_path);
+            let first_len = std::fs::metadata(&out_path).unwrap().len();
+            assert!(first_len > 0);
+            let reopened = image::open(&out_path).expect("exported image should be readable");
+            assert_eq!(reopened.dimensions(), (24, 18));
+
+            // Test overwriting an existing file in place
+            let saved_again = run_photo_export(&job).expect("overwrite export should succeed");
+            assert_eq!(saved_again, out_path);
+            assert!(std::fs::metadata(&out_path).unwrap().len() > 0);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

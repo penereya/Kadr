@@ -4,6 +4,7 @@ use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Rounding, Stroke, Vec2
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,7 +43,7 @@ impl AudioPlayer {
         })
     }
 
-    fn stop(self) {
+    fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
@@ -50,6 +51,12 @@ impl AudioPlayer {
                 let _ = child.wait();
             }
         }
+    }
+}
+
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -90,6 +97,7 @@ pub struct AudioExportJob {
     pub volume_pct: f32,
     pub fade_in: f64,
     pub fade_out: f64,
+    pub fade_strength: f32,
     pub format: AudioFormat,
 }
 
@@ -100,6 +108,8 @@ enum AudioTimelineDrag {
     TrimStart,
     TrimEnd,
     TrimWindow,
+    FadeIn,
+    FadeOut,
 }
 
 pub struct AudioEditor {
@@ -110,10 +120,13 @@ pub struct AudioEditor {
     pub trim_start: f64,
     pub trim_end: f64,
     pub volume_pct: f32, // 0.0..=300.0 (100.0 = original)
+    prev_volume_pct: f32,
     pub fade_in: f64,    // seconds
     pub fade_out: f64,   // seconds
+    pub fade_strength: f32, // 0.0..=100.0 (curve strength)
     pub format: AudioFormat,
     save_dialog: Option<media::PendingFileDialog>,
+    pending_waveform_rx: Option<Receiver<Result<Vec<f32>, String>>>,
     history: media::UndoHistory<AudioSnapshot>,
     frame_snapshot: Option<AudioSnapshot>,
     player: Option<AudioPlayer>,
@@ -130,6 +143,7 @@ pub struct AudioSnapshot {
     volume_pct: f32,
     fade_in: f64,
     fade_out: f64,
+    fade_strength: f32,
     format: AudioFormat,
 }
 
@@ -142,10 +156,13 @@ impl Default for AudioEditor {
             trim_start: 0.0,
             trim_end: 1.0,
             volume_pct: 15.0,
+            prev_volume_pct: 15.0,
             fade_in: 0.0,
             fade_out: 0.0,
+            fade_strength: 55.0,
             format: AudioFormat::Mp3,
             save_dialog: None,
+            pending_waveform_rx: None,
             history: media::UndoHistory::default(),
             frame_snapshot: None,
             player: None,
@@ -172,17 +189,39 @@ impl AudioEditor {
         }
     }
 
-    fn effective_playback_volume(&self) -> f32 {
+    fn fade_power(&self) -> f32 {
+        1.0 + (self.fade_strength.clamp(0.0, 100.0) / 100.0) * 2.2
+    }
+
+    fn fade_in_gain(&self, u: f32) -> f32 {
+        let u = u.clamp(0.0, 1.0);
+        let p = self.fade_power();
+        1.0 - (1.0 - u).powf(p)
+    }
+
+    fn fade_out_gain(&self, u: f32) -> f32 {
+        let u = u.clamp(0.0, 1.0);
+        let p = self.fade_power();
+        1.0 - u.powf(p)
+    }
+
+    fn fade_gain_at(&self, t_sec: f64) -> f32 {
         let mut mult = 1.0_f32;
-        if self.play_time >= self.trim_start && self.play_time <= self.trim_end {
-            if self.fade_in > 0.05 && (self.play_time - self.trim_start) < self.fade_in {
-                mult *= ((self.play_time - self.trim_start) / self.fade_in).clamp(0.0, 1.0) as f32;
+        if t_sec >= self.trim_start && t_sec <= self.trim_end {
+            if self.fade_in > 0.05 && (t_sec - self.trim_start) < self.fade_in {
+                let u = ((t_sec - self.trim_start) / self.fade_in) as f32;
+                mult *= self.fade_in_gain(u);
             }
-            if self.fade_out > 0.05 && (self.trim_end - self.play_time) < self.fade_out {
-                mult *= ((self.trim_end - self.play_time) / self.fade_out).clamp(0.0, 1.0) as f32;
+            if self.fade_out > 0.05 && (self.trim_end - t_sec) < self.fade_out {
+                let u = (1.0 - (self.trim_end - t_sec) / self.fade_out) as f32;
+                mult *= self.fade_out_gain(u);
             }
         }
-        self.volume_pct * mult
+        mult
+    }
+
+    fn effective_playback_volume(&self) -> f32 {
+        self.volume_pct * self.fade_gain_at(self.play_time)
     }
 
     fn sync_live_audio(&self) {
@@ -227,19 +266,31 @@ impl AudioEditor {
         self.start_playback_at(start);
     }
 
-    pub fn load(&mut self, path: PathBuf) -> Result<(), String> {
+    pub fn load(&mut self, path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         self.stop_playback();
         let info = media::probe_media(&path)?;
-        let waveform = media::extract_waveform(&path, 140).unwrap_or_else(|_| vec![0.25; 140]);
-        self.info = info.clone();
-        self.waveform = waveform;
-        self.path = Some(path);
+        self.info = info;
+        self.waveform = vec![0.15; 140];
+        self.path = Some(path.clone());
         self.reset_edits();
         self.volume_pct = 15.0;
+        self.prev_volume_pct = 15.0;
         self.play_time = 0.0;
         self.active_drag = AudioTimelineDrag::None;
+        self.resume_after_drag = false;
+        self.save_dialog = None;
         self.history.clear();
         self.frame_snapshot = None;
+
+        let (tx, rx) = mpsc::channel();
+        self.pending_waveform_rx = Some(rx);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let res = media::extract_waveform(&path, 140);
+            let _ = tx.send(res);
+            ctx_clone.request_repaint();
+        });
+
         Ok(())
     }
 
@@ -251,6 +302,8 @@ impl AudioEditor {
         self.play_time = 0.0;
         self.active_drag = AudioTimelineDrag::None;
         self.resume_after_drag = false;
+        self.save_dialog = None;
+        self.pending_waveform_rx = None;
         self.history.clear();
         self.frame_snapshot = None;
     }
@@ -262,6 +315,7 @@ impl AudioEditor {
             volume_pct: self.volume_pct,
             fade_in: self.fade_in,
             fade_out: self.fade_out,
+            fade_strength: self.fade_strength,
             format: self.format,
         }
     }
@@ -272,6 +326,7 @@ impl AudioEditor {
         self.volume_pct = s.volume_pct;
         self.fade_in = s.fade_in;
         self.fade_out = s.fade_out;
+        self.fade_strength = s.fade_strength;
         self.format = s.format;
         self.sync_live_audio();
     }
@@ -376,10 +431,18 @@ impl AudioEditor {
         }
         if vol_delta != 0.0 {
             self.volume_pct = (self.volume_pct + vol_delta).clamp(0.0, 300.0);
+            if self.volume_pct > 0.5 {
+                self.prev_volume_pct = self.volume_pct;
+            }
             self.sync_live_audio();
         }
         if mute {
-            self.volume_pct = if self.volume_pct > 0.5 { 0.0 } else { 15.0 };
+            if self.volume_pct > 0.5 {
+                self.prev_volume_pct = self.volume_pct;
+                self.volume_pct = 0.0;
+            } else {
+                self.volume_pct = self.prev_volume_pct.max(15.0);
+            }
             self.sync_live_audio();
         }
     }
@@ -413,20 +476,29 @@ impl AudioEditor {
         self.volume_pct = 100.0;
         self.fade_in = 0.0;
         self.fade_out = 0.0;
+        self.fade_strength = 55.0;
         self.format = AudioFormat::Mp3;
     }
 
     pub fn render_canvas(&mut self, ui: &mut egui::Ui) {
-        // Update playback clock
+        if let Some(rx) = &self.pending_waveform_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.pending_waveform_rx = None;
+                if let Ok(w) = res {
+                    self.waveform = w;
+                }
+            }
+        }
+
+        // Update playback clock (allow ~180ms drain after end_time so audio tail isn't clipped)
         let mut finished_playback = false;
         if let Some(p) = &self.player {
             let elapsed = p.started_at.elapsed().as_secs_f64();
             let cur = p.start_time + elapsed;
-            if cur >= p.end_time {
-                self.play_time = p.end_time;
+            self.play_time = cur.min(p.end_time);
+            if cur >= p.end_time + 0.18 {
                 finished_playback = true;
             } else {
-                self.play_time = cur;
                 ui.ctx().request_repaint_after(Duration::from_millis(33));
             }
         }
@@ -438,6 +510,7 @@ impl AudioEditor {
 
         // Top metadata bar
         let compact_bar = ui.available_width() < 420.0;
+        let mut closed = false;
         ui.horizontal_wrapped(|ui| {
             if let Some(p) = &self.path {
                 let full_name = p
@@ -463,10 +536,10 @@ impl AudioEditor {
                     .clicked()
                 {
                     self.clear();
-                    return;
+                    closed = true;
                 }
             }
-            if ui.max_rect().right() - ui.cursor().left() >= 200.0 {
+            if !closed && ui.max_rect().right() - ui.cursor().left() >= 200.0 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     theme::metadata_pill(ui, &theme::format_bytes(self.info.file_size));
                     if self.info.bitrate_kbps > 0 {
@@ -477,7 +550,7 @@ impl AudioEditor {
             }
         });
 
-        if !self.has_file() {
+        if closed || !self.has_file() {
             return;
         }
 
@@ -501,27 +574,97 @@ impl AudioEditor {
                 // Inner waveform area
                 let wave_rect = Rect::from_center_size(
                     rect.center(),
-                    Vec2::new((rect.width() - 56.0).max(120.0), (rect.height() * 0.52).clamp(90.0, 260.0)),
+                    Vec2::new(
+                        (rect.width() - 56.0).max(120.0),
+                        (rect.height() - 56.0).clamp(40.0, 260.0),
+                    ),
                 );
 
-                // Click/drag anywhere on waveform to seek playhead
+                let start_ratio = (self.trim_start / dur) as f32;
+                let end_ratio = (self.trim_end / dur) as f32;
+
+                // Highlighted active trim backdrop + crisp terracotta frame
+                let sel_left = wave_rect.left() + wave_rect.width() * start_ratio;
+                let sel_right = wave_rect.left() + wave_rect.width() * end_ratio;
+                let sel_rect = Rect::from_min_max(
+                    Pos2::new(sel_left, wave_rect.top() - 10.0),
+                    Pos2::new(sel_right.max(sel_left + 4.0), wave_rect.bottom() + 10.0),
+                );
+
+                // Compute Fade In / Fade Out handle positions on top edge of sel_rect
+                let max_fade = ((self.trim_end - self.trim_start) * 0.5).clamp(0.0, 15.0);
+                let fade_in_x =
+                    wave_rect.left() + wave_rect.width() * ((self.trim_start + self.fade_in) / dur) as f32;
+                let fade_out_x =
+                    wave_rect.left() + wave_rect.width() * ((self.trim_end - self.fade_out) / dur) as f32;
+                let fi_dot = Pos2::new(fade_in_x.clamp(sel_rect.left(), sel_rect.center().x), sel_rect.top());
+                let fo_dot = Pos2::new(fade_out_x.clamp(sel_rect.center().x, sel_rect.right()), sel_rect.top());
+
+                // Interactive drag for Fade In / Fade Out white handles + click/drag seek
                 let wave_resp = ui.interact(
-                    wave_rect.expand2(Vec2::new(4.0, 14.0)),
+                    wave_rect.expand2(Vec2::new(8.0, 18.0)),
                     ui.id().with("audio_wave_seek"),
                     egui::Sense::click_and_drag(),
                 );
-                if wave_resp.clicked() || wave_resp.dragged() {
+                if let Some(hpos) = wave_resp.hover_pos() {
+                    if hpos.distance(fi_dot) <= 13.0 || hpos.distance(fo_dot) <= 13.0 {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                }
+                if wave_resp.drag_started() {
+                    let origin = ui
+                        .ctx()
+                        .input(|i| i.pointer.press_origin())
+                        .or_else(|| wave_resp.interact_pointer_pos());
+                    if let Some(pos) = origin {
+                        if pos.distance(fi_dot) <= 16.0 {
+                            self.active_drag = AudioTimelineDrag::FadeIn;
+                        } else if pos.distance(fo_dot) <= 16.0 {
+                            self.active_drag = AudioTimelineDrag::FadeOut;
+                        } else {
+                            self.resume_after_drag = self.is_playing();
+                            self.stop_playback();
+                            self.active_drag = AudioTimelineDrag::Playhead;
+                            let ratio = ((pos.x - wave_rect.left()) / wave_rect.width().max(1.0))
+                                .clamp(0.0, 1.0) as f64;
+                            self.play_time = ratio * dur;
+                        }
+                    }
+                } else if wave_resp.clicked() {
                     if let Some(pos) = wave_resp.interact_pointer_pos() {
                         let ratio = ((pos.x - wave_rect.left()) / wave_rect.width().max(1.0))
                             .clamp(0.0, 1.0) as f64;
                         self.play_time = ratio * dur;
-                        if wave_resp.clicked() && self.is_playing() {
+                        if self.is_playing() {
                             self.start_playback_at(self.play_time);
                         }
                     }
                 }
-                if wave_resp.drag_stopped() && self.is_playing() {
-                    self.start_playback_at(self.play_time);
+                if wave_resp.dragged() {
+                    if let Some(pos) = wave_resp.interact_pointer_pos() {
+                        let ratio = ((pos.x - wave_rect.left()) / wave_rect.width().max(1.0))
+                            .clamp(0.0, 1.0) as f64;
+                        let t = ratio * dur;
+                        match self.active_drag {
+                            AudioTimelineDrag::FadeIn => {
+                                self.fade_in = (t - self.trim_start).clamp(0.0, max_fade);
+                            }
+                            AudioTimelineDrag::FadeOut => {
+                                self.fade_out = (self.trim_end - t).clamp(0.0, max_fade);
+                            }
+                            _ => {
+                                self.play_time = t;
+                            }
+                        }
+                    }
+                }
+                if wave_resp.drag_stopped() {
+                    let was_wave_playhead = self.active_drag == AudioTimelineDrag::Playhead;
+                    self.active_drag = AudioTimelineDrag::None;
+                    if was_wave_playhead && self.resume_after_drag {
+                        self.resume_after_drag = false;
+                        self.start_playback_at(self.play_time);
+                    }
                 }
 
                 let p = ui.painter();
@@ -532,25 +675,56 @@ impl AudioEditor {
                         Pos2::new(wave_rect.left(), wave_rect.center().y),
                         Pos2::new(wave_rect.right(), wave_rect.center().y),
                     ],
-                    Stroke::new(1.0, theme::BORDER_SUBTLE),
+                    Stroke::new(1.0_f32, theme::BORDER_SUBTLE),
                 );
 
-                let start_ratio = (self.trim_start / dur) as f32;
-                let end_ratio = (self.trim_end / dur) as f32;
-
-                // Highlighted active trim backdrop
-                let sel_left = wave_rect.left() + wave_rect.width() * start_ratio;
-                let sel_right = wave_rect.left() + wave_rect.width() * end_ratio;
-                let sel_rect = Rect::from_min_max(
-                    Pos2::new(sel_left, wave_rect.top() - 10.0),
-                    Pos2::new(sel_right.max(sel_left + 4.0), wave_rect.bottom() + 10.0),
+                // Top info strip above waveform box (like mockup)
+                let label_y = sel_rect.top() - 18.0;
+                p.text(
+                    Pos2::new(wave_rect.left(), label_y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("↘  Появление · {:.1} с", self.fade_in),
+                    egui::FontId::proportional(11.5),
+                    if self.fade_in > 0.05 { theme::ACCENT } else { theme::TEXT_MUTED },
                 );
-                p.rect_filled(sel_rect, Rounding::same(8.0), Color32::from_rgba_unmultiplied(217, 83, 47, 34));
+                if wave_rect.width() >= 560.0 {
+                    p.text(
+                        Pos2::new(wave_rect.center().x, label_y),
+                        egui::Align2::CENTER_CENTER,
+                        format!(
+                            "Фрагмент: {} — {}  ·  Длительность: {}",
+                            theme::format_time(self.trim_start),
+                            theme::format_time(self.trim_end),
+                            theme::format_time(clip_len),
+                        ),
+                        egui::FontId::proportional(11.5),
+                        theme::TEXT_SECONDARY,
+                    );
+                }
+                p.text(
+                    Pos2::new(wave_rect.right(), label_y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("Затухание · {:.1} с  ↙", self.fade_out),
+                    egui::FontId::proportional(11.5),
+                    if self.fade_out > 0.05 { theme::ACCENT } else { theme::TEXT_MUTED },
+                );
+
+                // Highlighted active trim backdrop + crisp terracotta frame
+                p.rect_filled(
+                    sel_rect,
+                    Rounding::same(3.0),
+                    Color32::from_rgba_unmultiplied(217, 83, 47, 28),
+                );
+                p.rect_stroke(
+                    sel_rect,
+                    Rounding::same(3.0),
+                    Stroke::new(1.5_f32, theme::ACCENT),
+                );
 
                 // Draw waveform bars
                 let count = self.waveform.len().max(1);
                 let step = wave_rect.width() / count as f32;
-                let bar_w = (step * 0.62).clamp(2.0, 6.0);
+                let bar_w = (step * 0.58).clamp(2.0, 6.0);
                 let vol_scale = (self.volume_pct / 100.0).clamp(0.1, 1.5);
 
                 for (i, &amp) in self.waveform.iter().enumerate() {
@@ -558,16 +732,11 @@ impl AudioEditor {
                     let t_sec = t_ratio as f64 * dur;
                     let in_range = t_sec >= self.trim_start && t_sec <= self.trim_end;
 
-                    // Compute fade envelope multiplier for visual feedback
-                    let mut fade_mult = 1.0_f32;
-                    if in_range {
-                        if self.fade_in > 0.05 && (t_sec - self.trim_start) < self.fade_in {
-                            fade_mult *= ((t_sec - self.trim_start) / self.fade_in).clamp(0.05, 1.0) as f32;
-                        }
-                        if self.fade_out > 0.05 && (self.trim_end - t_sec) < self.fade_out {
-                            fade_mult *= ((self.trim_end - t_sec) / self.fade_out).clamp(0.05, 1.0) as f32;
-                        }
-                    }
+                    let fade_mult = if in_range {
+                        self.fade_gain_at(t_sec).max(0.06)
+                    } else {
+                        1.0
+                    };
 
                     let visual_amp = if in_range {
                         (amp * vol_scale * fade_mult).clamp(0.04, 1.0)
@@ -590,15 +759,45 @@ impl AudioEditor {
                     p.rect_filled(bar_rect, Rounding::same(bar_w * 0.5), color);
                 }
 
-                // Trim boundary lines
-                p.line_segment(
-                    [Pos2::new(sel_left, sel_rect.top()), Pos2::new(sel_left, sel_rect.bottom())],
-                    Stroke::new(2.0, theme::ACCENT_HOVER),
-                );
-                p.line_segment(
-                    [Pos2::new(sel_right, sel_rect.top()), Pos2::new(sel_right, sel_rect.bottom())],
-                    Stroke::new(2.0, theme::ACCENT_HOVER),
-                );
+                // Dashed white Fade In curve + draggable white dot
+                if self.fade_in > 0.05 && fi_dot.x > sel_rect.left() + 2.0 {
+                    let steps = 20usize;
+                    let mut pts = Vec::with_capacity(steps + 1);
+                    for s in 0..=steps {
+                        let u = s as f32 / steps as f32;
+                        let g = self.fade_in_gain(u);
+                        let px = sel_rect.left() + (fi_dot.x - sel_rect.left()) * u;
+                        let py = sel_rect.bottom() - sel_rect.height() * g;
+                        pts.push(Pos2::new(px, py));
+                    }
+                    p.add(egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(1.5_f32, Color32::WHITE),
+                        5.0,
+                        4.0,
+                    ));
+                }
+                p.circle_filled(fi_dot, 4.5, Color32::WHITE);
+
+                // Dashed white Fade Out curve + draggable white dot
+                if self.fade_out > 0.05 && sel_rect.right() > fo_dot.x + 2.0 {
+                    let steps = 20usize;
+                    let mut pts = Vec::with_capacity(steps + 1);
+                    for s in 0..=steps {
+                        let u = s as f32 / steps as f32;
+                        let g = self.fade_out_gain(u);
+                        let px = fo_dot.x + (sel_rect.right() - fo_dot.x) * u;
+                        let py = sel_rect.bottom() - sel_rect.height() * g;
+                        pts.push(Pos2::new(px, py));
+                    }
+                    p.add(egui::Shape::dashed_line(
+                        &pts,
+                        Stroke::new(1.5_f32, Color32::WHITE),
+                        5.0,
+                        4.0,
+                    ));
+                }
+                p.circle_filled(fo_dot, 4.5, Color32::WHITE);
 
                 // Playhead line + cap
                 let play_ratio = (self.play_time / dur).clamp(0.0, 1.0) as f32;
@@ -608,25 +807,9 @@ impl AudioEditor {
                         Pos2::new(play_x, sel_rect.top() - 4.0),
                         Pos2::new(play_x, sel_rect.bottom() + 4.0),
                     ],
-                    Stroke::new(2.0_f32, Color32::WHITE),
+                    Stroke::new(1.8_f32, Color32::WHITE),
                 );
-                p.circle_filled(Pos2::new(play_x, sel_rect.top() - 4.0), 4.5, Color32::WHITE);
-
-                // Bottom summary text inside canvas
-                let summary = format!(
-                    "Выбранный фрагмент: {} — {}   •   Длительность: {}   •   Громкость: {:.0}%",
-                    theme::format_time(self.trim_start),
-                    theme::format_time(self.trim_end),
-                    theme::format_time(clip_len),
-                    self.volume_pct
-                );
-                p.text(
-                    Pos2::new(rect.center().x, wave_rect.bottom() + 34.0),
-                    egui::Align2::CENTER_CENTER,
-                    summary,
-                    egui::FontId::proportional(12.5),
-                    theme::TEXT_SECONDARY,
-                );
+                p.circle_filled(Pos2::new(play_x, sel_rect.top() - 4.0), 4.0, Color32::WHITE);
             });
 
         ui.add_space(10.0);
@@ -784,6 +967,9 @@ impl AudioEditor {
                             }
                         }
                         AudioTimelineDrag::Playhead => CursorIcon::PointingHand,
+                        AudioTimelineDrag::FadeIn | AudioTimelineDrag::FadeOut => {
+                            CursorIcon::ResizeHorizontal
+                        }
                         AudioTimelineDrag::None => CursorIcon::Default,
                     };
                     ui.ctx().set_cursor_icon(cursor);
@@ -838,7 +1024,9 @@ impl AudioEditor {
                             AudioTimelineDrag::Playhead => {
                                 self.play_time = t;
                             }
-                            AudioTimelineDrag::None => {}
+                            AudioTimelineDrag::FadeIn
+                            | AudioTimelineDrag::FadeOut
+                            | AudioTimelineDrag::None => {}
                         }
                     }
                 }
@@ -967,10 +1155,9 @@ impl AudioEditor {
                                 .show_value(false),
                         )
                         .changed()
+                        && self.trim_start >= self.trim_end - 0.1
                     {
-                        if self.trim_start >= self.trim_end - 0.1 {
-                            self.trim_end = (self.trim_start + 0.1).min(dur);
-                        }
+                        self.trim_end = (self.trim_start + 0.1).min(dur);
                     }
 
                     ui.add_space(4.0);
@@ -989,10 +1176,9 @@ impl AudioEditor {
                     if ui
                         .add(egui::Slider::new(&mut self.trim_end, 0.1..=dur).show_value(false))
                         .changed()
+                        && self.trim_end <= self.trim_start + 0.1
                     {
-                        if self.trim_end <= self.trim_start + 0.1 {
-                            self.trim_start = (self.trim_end - 0.1).max(0.0);
-                        }
+                        self.trim_start = (self.trim_end - 0.1).max(0.0);
                     }
                 });
 
@@ -1017,6 +1203,9 @@ impl AudioEditor {
                         });
                     });
                     if theme::volume_slider_with_steps(ui, &mut self.volume_pct) {
+                        if self.volume_pct > 0.5 {
+                            self.prev_volume_pct = self.volume_pct;
+                        }
                         self.sync_live_audio();
                     }
                 });
@@ -1024,7 +1213,7 @@ impl AudioEditor {
                 ui.add_space(10.0);
 
                 // Fade In / Out card
-                let max_fade = ((self.trim_end - self.trim_start) * 0.5).clamp(0.5, 15.0);
+                let max_fade = ((self.trim_end - self.trim_start) * 0.5).clamp(0.0, 15.0);
                 self.fade_in = self.fade_in.min(max_fade);
                 self.fade_out = self.fade_out.min(max_fade);
 
@@ -1053,6 +1242,27 @@ impl AudioEditor {
                         });
                     });
                     ui.add(egui::Slider::new(&mut self.fade_out, 0.0..=max_fade).show_value(false));
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Сила затухания")
+                                .size(12.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", self.fade_strength))
+                                    .size(12.0)
+                                    .color(theme::TEXT_PRIMARY),
+                            );
+                        });
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.fade_strength, 0.0..=100.0)
+                            .fixed_decimals(0)
+                            .show_value(false),
+                    );
                 });
 
                 ui.add_space(10.0);
@@ -1098,6 +1308,7 @@ impl AudioEditor {
                     volume_pct: self.volume_pct,
                     fade_in: self.fade_in,
                     fade_out: self.fade_out,
+                    fade_strength: self.fade_strength,
                     format: self.format,
                 });
             }
@@ -1113,7 +1324,14 @@ impl AudioEditor {
     }
 }
 
-pub fn run_audio_export(job: &AudioExportJob) -> Result<PathBuf, String> {
+fn build_audio_cmd(
+    job: &AudioExportJob,
+    duration: f64,
+    has_volume_change: bool,
+    fade_in: f64,
+    fade_out: f64,
+    stream_copy: bool,
+) -> std::process::Command {
     let mut cmd = media::hidden_command("ffmpeg");
     cmd.arg("-y");
 
@@ -1122,54 +1340,117 @@ pub fn run_audio_export(job: &AudioExportJob) -> Result<PathBuf, String> {
     }
 
     cmd.arg("-i").arg(&job.input);
+    cmd.args(["-t", &format!("{:.3}", duration), "-vn"]);
 
-    let duration = (job.trim_end - job.trim_start).max(0.1);
-    cmd.args(["-t", &format!("{:.3}", duration)]);
-    cmd.arg("-vn");
-
-    let mut af_parts: Vec<String> = Vec::new();
-    if (job.volume_pct - 100.0).abs() > 0.5 {
-        af_parts.push(format!("volume={:.3}", (job.volume_pct / 100.0).max(0.0)));
-    }
-    if job.fade_in > 0.05 {
-        af_parts.push(format!("afade=t=in:st=0:d={:.2}", job.fade_in));
-    }
-    if job.fade_out > 0.05 {
-        let st = (duration - job.fade_out).max(0.0);
-        af_parts.push(format!("afade=t=out:st={:.2}:d={:.2}", st, job.fade_out));
-    }
-
-    if !af_parts.is_empty() {
-        cmd.args(["-af", &af_parts.join(",")]);
-    }
-
-    match job.format {
-        AudioFormat::Mp3 => {
-            cmd.args(["-c:a", "libmp3lame", "-q:a", "2"]);
+    if stream_copy {
+        cmd.args(["-c:a", "copy"]);
+    } else {
+        let mut af_parts: Vec<String> = Vec::new();
+        if has_volume_change {
+            af_parts.push(format!("volume={:.3}", (job.volume_pct / 100.0).max(0.0)));
         }
-        AudioFormat::Wav => {
-            cmd.args(["-c:a", "pcm_s16le"]);
+        let fade_curve = if job.fade_strength < 20.0 {
+            "tri"
+        } else if job.fade_strength < 50.0 {
+            "qsin"
+        } else if job.fade_strength < 80.0 {
+            "ipar"
+        } else {
+            "log"
+        };
+        if fade_in > 0.05 {
+            af_parts.push(format!("afade=t=in:st=0:d={:.2}:curve={}", fade_in, fade_curve));
         }
-        AudioFormat::Ogg => {
-            cmd.args(["-c:a", "libvorbis", "-q:a", "5"]);
+        if fade_out > 0.05 {
+            let st = (duration - fade_out).max(0.0);
+            af_parts.push(format!(
+                "afade=t=out:st={:.2}:d={:.2}:curve={}",
+                st, fade_out, fade_curve
+            ));
         }
-        AudioFormat::M4a => {
-            cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+
+        if !af_parts.is_empty() {
+            cmd.args(["-af", &af_parts.join(",")]);
+        }
+
+        match job.format {
+            AudioFormat::Mp3 => {
+                cmd.args(["-c:a", "libmp3lame", "-q:a", "2"]);
+            }
+            AudioFormat::Wav => {
+                cmd.args(["-c:a", "pcm_s16le"]);
+            }
+            AudioFormat::Ogg => {
+                cmd.args(["-c:a", "libvorbis", "-q:a", "5"]);
+            }
+            AudioFormat::M4a => {
+                cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+            }
         }
     }
 
-    cmd.arg(&job.output);
-    execute_ffmpeg(cmd, &job.output)
+    cmd
 }
 
-fn execute_ffmpeg(mut cmd: std::process::Command, out: &Path) -> Result<PathBuf, String> {
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let last_line = stderr.lines().last().unwrap_or("Неизвестная ошибка ffmpeg");
-        return Err(format!("Ошибка экспорта: {}", last_line));
+pub fn run_audio_export(
+    job: &AudioExportJob,
+    progress: Arc<AtomicU32>,
+) -> Result<PathBuf, String> {
+    let overwrite_in_place = media::is_same_file(&job.input, &job.output);
+    let actual_out = if overwrite_in_place {
+        media::temp_output_path(&job.output)
+    } else {
+        job.output.clone()
+    };
+
+    let duration = (job.trim_end - job.trim_start).max(0.1);
+    let has_volume_change = (job.volume_pct - 100.0).abs() > 0.5;
+    let fade_in = job.fade_in.clamp(0.0, duration * 0.5);
+    let fade_out = job.fade_out.clamp(0.0, (duration - fade_in).max(0.0));
+    let has_fades = fade_in > 0.05 || fade_out > 0.05;
+
+    let in_ext = job
+        .input
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let can_stream_copy = !has_volume_change && !has_fades && in_ext == job.format.ext();
+
+    let res = if can_stream_copy {
+        let cmd = build_audio_cmd(job, duration, has_volume_change, fade_in, fade_out, true);
+        match media::execute_ffmpeg_with_progress(
+            cmd,
+            &actual_out,
+            duration,
+            Arc::clone(&progress),
+        ) {
+            Ok(p) => Ok(p),
+            Err(_) => {
+                let _ = std::fs::remove_file(&actual_out);
+                progress.store(0.0_f32.to_bits(), Ordering::Relaxed);
+                let enc_cmd =
+                    build_audio_cmd(job, duration, has_volume_change, fade_in, fade_out, false);
+                media::execute_ffmpeg_with_progress(enc_cmd, &actual_out, duration, progress)
+            }
+        }
+    } else {
+        let enc_cmd = build_audio_cmd(job, duration, has_volume_change, fade_in, fade_out, false);
+        media::execute_ffmpeg_with_progress(enc_cmd, &actual_out, duration, progress)
+    };
+
+    if overwrite_in_place {
+        match res {
+            Ok(_) => {
+                media::finalize_temp_replace(&actual_out, &job.output)?;
+                Ok(job.output.clone())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&actual_out);
+                Err(e)
+            }
+        }
+    } else {
+        res
     }
-    Ok(out.to_path_buf())
 }
