@@ -169,7 +169,44 @@ fn perform_install(
     }
 
     let _ = register_uninstall_entry(install_dir, &ico_path, &uninstall_path);
+    let _ = register_open_with(&exe_path, &ico_path);
     Ok(exe_path)
+}
+
+fn register_open_with(exe_path: &Path, ico_path: &Path) -> Result<(), String> {
+    let base = r"HKCU:\Software\Classes\Applications\Kadr.exe";
+    let cmd = format!("\"{}\" \"%1\"", exe_path.to_string_lossy());
+    let exts = [
+        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
+        ".mp4", ".mkv", ".avi", ".mov", ".webm",
+        ".mp3", ".wav", ".ogg", ".flac", ".m4a",
+    ];
+    let ext_cmds: String = exts
+        .iter()
+        .map(|ext| format!("Set-ItemProperty -Path '{}\\SupportedTypes' -Name '{}' -Value ''; ", base, ext))
+        .collect();
+
+    let script = format!(
+        "New-Item -Path '{}' -Force | Out-Null; \
+         Set-ItemProperty -Path '{}' -Name 'FriendlyAppName' -Value 'Kadr — Медиаредактор'; \
+         New-Item -Path '{}\\DefaultIcon' -Force | Out-Null; \
+         Set-ItemProperty -Path '{}\\DefaultIcon' -Name '(default)' -Value '{}'; \
+         New-Item -Path '{}\\shell\\open\\command' -Force | Out-Null; \
+         Set-ItemProperty -Path '{}\\shell\\open\\command' -Name '(default)' -Value '{}'; \
+         New-Item -Path '{}\\SupportedTypes' -Force | Out-Null; \
+         {}",
+        base,
+        base,
+        base,
+        base,
+        escape_ps_single(&ico_path.to_string_lossy()),
+        base,
+        base,
+        escape_ps_single(&cmd),
+        base,
+        ext_cmds
+    );
+    run_ps(&script)
 }
 
 fn perform_uninstall() -> Result<(), String> {
@@ -180,7 +217,7 @@ fn perform_uninstall() -> Result<(), String> {
         let _ = std::fs::remove_file(lnk);
     }
     let _ = run_ps(
-        r"Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue",
+        r"Remove-Item -Path 'HKCU:\Software\Classes\Applications\Kadr.exe' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue",
     );
 
     let dir = default_install_dir();
