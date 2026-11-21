@@ -175,36 +175,54 @@ fn perform_install(
 
 fn register_open_with(exe_path: &Path, ico_path: &Path) -> Result<(), String> {
     let base = r"HKCU:\Software\Classes\Applications\Kadr.exe";
+    let prog_id = r"HKCU:\Software\Classes\Kadr.Media";
+    let cap = r"HKCU:\Software\Kadr\Capabilities";
     let cmd = format!("\"{}\" \"%1\"", exe_path.to_string_lossy());
+    let ico_escaped = escape_ps_single(&ico_path.to_string_lossy());
+    let cmd_escaped = escape_ps_single(&cmd);
+
     let exts = [
         ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
         ".mp4", ".mkv", ".avi", ".mov", ".webm",
         ".mp3", ".wav", ".ogg", ".flac", ".m4a",
     ];
-    let ext_cmds: String = exts
-        .iter()
-        .map(|ext| format!("Set-ItemProperty -Path '{}\\SupportedTypes' -Name '{}' -Value ''; ", base, ext))
-        .collect();
+    let mut ext_cmds = String::new();
+    for ext in &exts {
+        ext_cmds.push_str(&format!(
+            "Set-ItemProperty -Path '{}\\SupportedTypes' -Name '{}' -Value ''; \
+             New-Item -Path 'HKCU:\\Software\\Classes\\{}\\OpenWithProgids' -Force | Out-Null; \
+             Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\{}\\OpenWithProgids' -Name 'Kadr.Media' -Value ''; \
+             Set-ItemProperty -Path '{}\\FileAssociations' -Name '{}' -Value 'Kadr.Media'; ",
+            base, ext, ext, ext, cap, ext
+        ));
+    }
 
     let script = format!(
-        "New-Item -Path '{}' -Force | Out-Null; \
-         Set-ItemProperty -Path '{}' -Name 'FriendlyAppName' -Value 'Kadr — Медиаредактор'; \
-         New-Item -Path '{}\\DefaultIcon' -Force | Out-Null; \
-         Set-ItemProperty -Path '{}\\DefaultIcon' -Name '(default)' -Value '{}'; \
-         New-Item -Path '{}\\shell\\open\\command' -Force | Out-Null; \
-         Set-ItemProperty -Path '{}\\shell\\open\\command' -Name '(default)' -Value '{}'; \
-         New-Item -Path '{}\\SupportedTypes' -Force | Out-Null; \
-         {}",
-        base,
-        base,
-        base,
-        base,
-        escape_ps_single(&ico_path.to_string_lossy()),
-        base,
-        base,
-        escape_ps_single(&cmd),
-        base,
-        ext_cmds
+        "New-Item -Path '{base}' -Force | Out-Null; \
+         Set-ItemProperty -Path '{base}' -Name 'FriendlyAppName' -Value 'Kadr — Медиаредактор'; \
+         New-Item -Path '{base}\\DefaultIcon' -Force | Out-Null; \
+         Set-ItemProperty -Path '{base}\\DefaultIcon' -Name '(default)' -Value '{ico}'; \
+         New-Item -Path '{base}\\shell\\open\\command' -Force | Out-Null; \
+         Set-ItemProperty -Path '{base}\\shell\\open\\command' -Name '(default)' -Value '{cmd}'; \
+         New-Item -Path '{base}\\SupportedTypes' -Force | Out-Null; \
+         New-Item -Path '{prog}' -Force | Out-Null; \
+         Set-ItemProperty -Path '{prog}' -Name '(default)' -Value 'Kadr — Медиафайл'; \
+         New-Item -Path '{prog}\\DefaultIcon' -Force | Out-Null; \
+         Set-ItemProperty -Path '{prog}\\DefaultIcon' -Name '(default)' -Value '{ico}'; \
+         New-Item -Path '{prog}\\shell\\open\\command' -Force | Out-Null; \
+         Set-ItemProperty -Path '{prog}\\shell\\open\\command' -Name '(default)' -Value '{cmd}'; \
+         New-Item -Path '{cap}\\FileAssociations' -Force | Out-Null; \
+         Set-ItemProperty -Path '{cap}' -Name 'ApplicationName' -Value 'Kadr — Медиаредактор'; \
+         Set-ItemProperty -Path '{cap}' -Name 'ApplicationDescription' -Value 'Простое и лёгкое приложение с базовыми функциями редактора медиа'; \
+         New-Item -Path 'HKCU:\\Software\\RegisteredApplications' -Force | Out-Null; \
+         Set-ItemProperty -Path 'HKCU:\\Software\\RegisteredApplications' -Name 'Kadr' -Value 'Software\\Kadr\\Capabilities'; \
+         {ext_cmds}",
+        base = base,
+        prog = prog_id,
+        cap = cap,
+        ico = ico_escaped,
+        cmd = cmd_escaped,
+        ext_cmds = ext_cmds,
     );
     run_ps(&script)
 }
@@ -217,7 +235,7 @@ fn perform_uninstall() -> Result<(), String> {
         let _ = std::fs::remove_file(lnk);
     }
     let _ = run_ps(
-        r"Remove-Item -Path 'HKCU:\Software\Classes\Applications\Kadr.exe' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue",
+        r"Remove-Item -Path 'HKCU:\Software\Classes\Applications\Kadr.exe' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Classes\Kadr.Media' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Kadr' -Recurse -Force -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKCU:\Software\RegisteredApplications' -Name 'Kadr' -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue",
     );
 
     let dir = default_install_dir();
