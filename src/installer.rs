@@ -197,6 +197,18 @@ fn register_open_with(exe_path: &Path, ico_path: &Path) -> Result<(), String> {
         ));
     }
 
+    for assoc in &["video", "image", "audio", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".mp3", ".wav", ".flac"] {
+        ext_cmds.push_str(&format!(
+            "New-Item -Path 'HKCU:\\Software\\Classes\\SystemFileAssociations\\{assoc}\\shell\\EditWithKadr\\command' -Force | Out-Null; \
+             Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\SystemFileAssociations\\{assoc}\\shell\\EditWithKadr' -Name '(default)' -Value 'Редактировать с помощью Kadr'; \
+             Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\SystemFileAssociations\\{assoc}\\shell\\EditWithKadr' -Name 'Icon' -Value '{ico}'; \
+             Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\SystemFileAssociations\\{assoc}\\shell\\EditWithKadr\\command' -Name '(default)' -Value '{cmd}'; ",
+            assoc = assoc,
+            ico = ico_escaped,
+            cmd = cmd_escaped,
+        ));
+    }
+
     let script = format!(
         "New-Item -Path '{base}' -Force | Out-Null; \
          Set-ItemProperty -Path '{base}' -Name 'FriendlyAppName' -Value 'Kadr — Медиаредактор'; \
@@ -235,7 +247,7 @@ fn perform_uninstall() -> Result<(), String> {
         let _ = std::fs::remove_file(lnk);
     }
     let _ = run_ps(
-        r"Remove-Item -Path 'HKCU:\Software\Classes\Applications\Kadr.exe' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Classes\Kadr.Media' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Kadr' -Recurse -Force -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKCU:\Software\RegisteredApplications' -Name 'Kadr' -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue",
+        r#"foreach ($a in @('video','image','audio','.mp4','.mkv','.avi','.mov','.webm','.png','.jpg','.jpeg','.webp','.mp3','.wav','.flac')) { Remove-Item -Path "HKCU:\Software\Classes\SystemFileAssociations\$a\shell\EditWithKadr" -Recurse -Force -ErrorAction SilentlyContinue }; Remove-Item -Path 'HKCU:\Software\Classes\Applications\Kadr.exe' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Classes\Kadr.Media' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Kadr' -Recurse -Force -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKCU:\Software\RegisteredApplications' -Name 'Kadr' -ErrorAction SilentlyContinue; Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kadr' -Recurse -Force -ErrorAction SilentlyContinue"#,
     );
 
     let dir = default_install_dir();
