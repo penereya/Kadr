@@ -247,6 +247,21 @@ impl InstallerApp {
     }
 }
 
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let w = ui.available_width().max(120.0);
+    let btn = egui::Button::new(
+        egui::RichText::new(text)
+            .size(14.5)
+            .color(egui::Color32::WHITE)
+            .strong(),
+    )
+    .fill(theme::ACCENT)
+    .stroke(Stroke::NONE)
+    .rounding(Rounding::same(10.0))
+    .min_size(Vec2::new(w, 42.0));
+    ui.add_sized(Vec2::new(w, 42.0), btn)
+}
+
 impl eframe::App for InstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default()
@@ -334,8 +349,8 @@ impl eframe::App for InstallerApp {
                                     );
                                 });
 
-                            ui.add_space(22.0);
-                            if theme::accent_button(ui, "Установить Kadr").clicked() {
+                            ui.add_space(18.0);
+                            if primary_button(ui, "Установить Kadr").clicked() {
                                 match perform_install(
                                     &self.install_dir,
                                     self.desktop_shortcut,
@@ -372,8 +387,8 @@ impl eframe::App for InstallerApp {
                                     );
                                 });
 
-                            ui.add_space(22.0);
-                            if theme::accent_button(ui, "Запустить Kadr").clicked() {
+                            ui.add_space(18.0);
+                            if primary_button(ui, "Запустить Kadr").clicked() {
                                 let _ = Command::new(&exe_clone).spawn();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
@@ -440,7 +455,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Установка Kadr")
-            .with_inner_size([480.0, 320.0])
+            .with_inner_size([520.0, 370.0])
             .with_resizable(false)
             .with_icon(load_app_icon()),
         ..Default::default()
