@@ -2,6 +2,7 @@ use crate::audio::{self, AudioEditor};
 use crate::media;
 use crate::photo::{self, PhotoEditor};
 use crate::theme;
+use crate::updater;
 use crate::video::{self, VideoCanvasAction, VideoEditor};
 use eframe::egui::{self, Align, Color32, Layout, Margin, Pos2, Rect, Rounding, Stroke, Vec2};
 use std::path::{Path, PathBuf};
@@ -60,6 +61,10 @@ pub struct KadrApp {
     screenshot_started: std::time::Instant,
     screenshot_sent: bool,
     logo_texture: Option<egui::TextureHandle>,
+    update_check_rx: Option<(Receiver<Result<updater::ReleaseInfo, String>>, bool)>,
+    available_update: Option<updater::ReleaseInfo>,
+    update_modal_open: bool,
+    update_install_rx: Option<Receiver<Result<(), String>>>,
 }
 
 fn settings_file_path() -> Option<PathBuf> {
@@ -109,6 +114,7 @@ fn load_brand_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 
 impl KadrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        updater::cleanup_old_binary();
         theme::setup_fonts(&cc.egui_ctx);
         theme::apply_graphite_theme(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -134,6 +140,10 @@ impl KadrApp {
             screenshot_started: std::time::Instant::now(),
             screenshot_sent: false,
             logo_texture,
+            update_check_rx: None,
+            available_update: None,
+            update_modal_open: false,
+            update_install_rx: None,
         };
 
         let mut args = std::env::args_os().skip(1);
@@ -150,7 +160,200 @@ impl KadrApp {
             }
         }
 
+        if app.screenshot_out.is_none() {
+            app.start_update_check(&cc.egui_ctx, false);
+        }
+
         app
+    }
+
+    fn start_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.update_check_rx.is_some() || self.update_install_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update_check_rx = Some((rx, manual));
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let res = updater::check_latest_release();
+            let _ = tx.send(res);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn start_update_install(&mut self, ctx: &egui::Context, url: String) {
+        if self.update_install_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update_install_rx = Some(rx);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let res = updater::download_and_install_update(&url);
+            let _ = tx.send(res);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if let Some((rx, manual)) = &self.update_check_rx {
+            if let Ok(res) = rx.try_recv() {
+                let manual = *manual;
+                self.update_check_rx = None;
+                match res {
+                    Ok(rel) => {
+                        if updater::is_newer_version(updater::CURRENT_VERSION, &rel.tag) {
+                            self.available_update = Some(rel);
+                            if manual {
+                                self.update_modal_open = true;
+                            }
+                        } else if manual {
+                            self.status = Some(StatusBanner {
+                                kind: StatusKind::Success(None),
+                                message: format!(
+                                    "У тебя установлена последняя версия Kadr (v{})",
+                                    updater::CURRENT_VERSION
+                                ),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        if manual {
+                            self.status = Some(StatusBanner {
+                                kind: StatusKind::Error,
+                                message: err,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = &self.update_install_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.update_install_rx = None;
+                match res {
+                    Ok(()) => {
+                        self.video.stop_playback();
+                        self.audio.stop_playback();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(err) => {
+                        self.update_modal_open = false;
+                        self.status = Some(StatusBanner {
+                            kind: StatusKind::Error,
+                            message: err,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_update_modal(&mut self, ctx: &egui::Context) {
+        if !self.update_modal_open {
+            return;
+        }
+        let Some(rel) = self.available_update.clone() else {
+            self.update_modal_open = false;
+            return;
+        };
+
+        let mut open = self.update_modal_open;
+        let installing = self.update_install_rx.is_some();
+
+        egui::Window::new("Обновление Kadr")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(420.0, 260.0))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::BG_SURFACE)
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .rounding(Rounding::same(14.0))
+                    .inner_margin(Margin::same(18.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Текущая версия: v{}  →  Новая: {}",
+                        updater::CURRENT_VERSION,
+                        rel.tag
+                    ))
+                    .size(13.5)
+                    .color(theme::TEXT_PRIMARY)
+                    .strong(),
+                );
+
+                if !rel.notes.is_empty() {
+                    ui.add_space(10.0);
+                    egui::Frame::none()
+                        .fill(theme::BG_BASE)
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(10.0))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(140.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&rel.notes)
+                                            .size(12.0)
+                                            .color(theme::TEXT_SECONDARY),
+                                    );
+                                });
+                        });
+                }
+
+                ui.add_space(14.0);
+
+                if installing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Скачивание новой версии...")
+                                .size(13.0)
+                                .color(theme::TEXT_PRIMARY),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if let Some(url) = rel.download_url.clone() {
+                            let btn = egui::Button::new(
+                                egui::RichText::new("Обновить сейчас")
+                                    .size(13.0)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(theme::ACCENT)
+                            .stroke(Stroke::NONE)
+                            .rounding(Rounding::same(8.0))
+                            .min_size(Vec2::new(140.0, 32.0));
+                            if ui.add(btn).clicked() {
+                                self.start_update_install(ctx, url);
+                            }
+                        }
+
+                        if theme::subtle_button(ui, "Открыть на GitHub").clicked() {
+                            updater::open_url(&rel.html_url);
+                        }
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::subtle_button(ui, "Позже").clicked() {
+                                self.update_modal_open = false;
+                            }
+                        });
+                    });
+                }
+            });
+
+        if !open && !installing {
+            self.update_modal_open = false;
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -443,7 +646,77 @@ impl KadrApp {
                             .color(theme::TEXT_PRIMARY)
                             .strong(),
                     );
-                    left_end = brand_resp.rect.right();
+                    ui.add_space(6.0);
+                    let ver_resp = if self.update_install_rx.is_some() {
+                        ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Обновление...")
+                                    .size(11.5)
+                                    .color(theme::TEXT_PRIMARY),
+                            )
+                            .fill(theme::ACCENT_SOFT)
+                            .stroke(Stroke::new(1.0_f32, theme::ACCENT))
+                            .rounding(Rounding::same(6.0))
+                            .min_size(Vec2::new(60.0, 22.0)),
+                        )
+                    } else if let Some(rel) = self.available_update.clone() {
+                        let label = if compact {
+                            format!("↑ {}", rel.tag)
+                        } else {
+                            format!("Обновить {}", rel.tag)
+                        };
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .size(11.5)
+                                        .color(theme::TEXT_PRIMARY)
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT_SOFT)
+                                .stroke(Stroke::new(1.0_f32, theme::ACCENT))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(52.0, 22.0)),
+                            )
+                            .on_hover_text("Доступна новая версия — нажми для обновления");
+                        if resp.clicked() {
+                            self.update_modal_open = true;
+                        }
+                        resp
+                    } else if self.update_check_rx.is_some() {
+                        ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Проверка...")
+                                    .size(11.5)
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .fill(theme::BG_BASE)
+                            .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                            .rounding(Rounding::same(6.0))
+                            .min_size(Vec2::new(52.0, 22.0)),
+                        )
+                    } else {
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("v{}", updater::CURRENT_VERSION))
+                                        .size(11.5)
+                                        .color(theme::TEXT_SECONDARY),
+                                )
+                                .fill(theme::BG_BASE)
+                                .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                                .rounding(Rounding::same(6.0))
+                                .min_size(Vec2::new(42.0, 22.0)),
+                            )
+                            .on_hover_text(
+                                "Версия программы · Нажми, чтобы проверить обновления на GitHub",
+                            );
+                        if resp.clicked() {
+                            self.start_update_check(ctx, true);
+                        }
+                        resp
+                    };
+                    left_end = brand_resp.rect.right().max(ver_resp.rect.right());
 
                     // Right: Open file button + UI scale capsule
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -853,11 +1126,13 @@ impl eframe::App for KadrApp {
         }
 
         self.poll_background_export();
-        if self.is_busy() {
+        self.poll_updates(ctx);
+        if self.is_busy() || self.update_check_rx.is_some() || self.update_install_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
         self.handle_app_shortcuts(ctx);
+        self.render_update_modal(ctx);
 
         match self.tab {
             ActiveTab::Photo if self.photo.has_file() => self.photo.begin_history_frame(),

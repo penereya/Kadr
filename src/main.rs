@@ -5,6 +5,7 @@ mod audio;
 mod media;
 mod photo;
 mod theme;
+mod updater;
 mod video;
 
 use eframe::egui;
