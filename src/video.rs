@@ -108,6 +108,7 @@ pub struct VideoExportJob {
     pub source_audio_codec: String,
     pub has_audio: bool,
     pub source_ext: String,
+    pub target_video_kbps: Option<u32>,
 }
 
 pub struct VideoExportResult {
@@ -149,6 +150,7 @@ impl VideoPlayer {
         end_time: f64,
         width: u32,
         height: u32,
+        src_fps: f64,
         has_audio: bool,
         play_audio: bool,
         volume_pct: f32,
@@ -156,7 +158,7 @@ impl VideoPlayer {
     ) -> Result<Self, String> {
         let (src_w, src_h) = (width.max(2), height.max(2));
 
-        let max_w = 960u32;
+        let max_w = 1920u32;
         let (out_w, out_h) = if src_w > max_w {
             let h = ((src_h as f64 * max_w as f64 / src_w as f64).round() as u32) & !1;
             (max_w, h.max(2))
@@ -164,8 +166,16 @@ impl VideoPlayer {
             ((src_w & !1).max(2), (src_h & !1).max(2))
         };
 
-        let fps = 24.0_f64;
-        let vf = format!("scale={}:{},fps={}", out_w, out_h, fps as u32);
+        let fps = if src_fps > 1.0 {
+            src_fps.clamp(15.0, 30.0)
+        } else {
+            30.0
+        };
+        let vf = if out_w == src_w && out_h == src_h {
+            format!("fps={}", fps.round() as u32)
+        } else {
+            format!("scale={}:{}:flags=bilinear,fps={}", out_w, out_h, fps.round() as u32)
+        };
 
         let duration = (end_time - start_time).max(0.1);
 
@@ -678,6 +688,7 @@ impl VideoEditor {
             end.max(clamped_start + 0.1),
             self.info.width,
             self.info.height,
+            self.info.fps,
             self.info.has_audio,
             play_audio,
             self.volume_pct,
@@ -697,6 +708,7 @@ impl VideoEditor {
     pub fn toggle_playback(&mut self, ctx: &egui::Context) {
         if self.is_playing() {
             self.stop_playback();
+            self.request_frame_async(ctx);
             return;
         }
 
@@ -727,44 +739,29 @@ impl VideoEditor {
             return ((gif_kbps * 1000.0 / 8.0) * clip_len) as u64;
         }
 
-        let pixels = (self.info.width.max(320) as f64) * (self.info.height.max(240) as f64);
-        let res_factor = (pixels / (1920.0 * 1080.0)).powf(0.75).clamp(0.15, 4.0);
-        let base_kbps = match self.quality {
-            VideoQuality::Original => 8000.0,
-            VideoQuality::High => 4800.0,
-            VideoQuality::Balanced => 2200.0,
-            VideoQuality::Compact => 950.0,
-        };
-        let mut video_kbps = base_kbps * res_factor;
-
-        let orig_kbps =
-            (self.info.file_size as f64 * 8.0) / (self.info.duration_secs.max(0.1) * 1000.0);
-        if orig_kbps > 100.0 {
-            let cap_ratio = match self.quality {
-                VideoQuality::Original => 1.05,
-                VideoQuality::High => 0.85,
-                VideoQuality::Balanced => 0.55,
-                VideoQuality::Compact => 0.30,
-            };
-            video_kbps = video_kbps.min(orig_kbps * cap_ratio);
-        }
-
-        if self.format == VideoFormat::Webm {
-            video_kbps *= 0.78;
-        }
-
-        let audio_kbps = match self.audio_mode {
-            VideoAudioMode::Keep => {
-                if self.format == VideoFormat::Webm {
-                    128.0
-                } else {
-                    192.0
-                }
+        if self.quality == VideoQuality::Original {
+            let ratio = (clip_len / self.info.duration_secs.max(0.1)).clamp(0.0, 1.0);
+            let mut est = self.info.file_size as f64 * ratio;
+            if self.format == VideoFormat::Webm {
+                est *= 0.85;
             }
-            VideoAudioMode::Mute | VideoAudioMode::ExtractMp3 => 0.0,
+            if self.audio_mode == VideoAudioMode::Mute && self.info.has_audio {
+                est = (est - (192_000.0 / 8.0) * clip_len).max(0.0);
+            }
+            return est as u64;
+        }
+
+        let video_kbps = compute_target_video_kbps(&self.info, self.quality, self.format)
+            .unwrap_or(2600) as f64;
+        let audio_kbps = if !self.info.has_audio || self.audio_mode == VideoAudioMode::Mute {
+            0.0
+        } else if self.format == VideoFormat::Webm {
+            128.0
+        } else {
+            192.0
         };
 
-        (((video_kbps + audio_kbps) * 1000.0 / 8.0) * clip_len) as u64
+        (((video_kbps + audio_kbps) * 1000.0 / 8.0) * clip_len * 1.01) as u64
     }
 
     pub fn load(&mut self, path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
@@ -811,6 +808,7 @@ impl VideoEditor {
     fn poll_frames(&mut self, ctx: &egui::Context) {
         // 1. Poll live playback frames
         let mut stop_at_end = false;
+        let mut ended_naturally = false;
         if let Some(player) = &self.player {
             let mut latest: Option<PlaybackFrame> = None;
             while let Ok(frame) = player.frame_rx.try_recv() {
@@ -833,10 +831,14 @@ impl VideoEditor {
             }
             if player.finished.load(Ordering::Relaxed) {
                 self.player = None;
+                ended_naturally = true;
             }
         }
         if stop_at_end {
             self.stop_playback();
+        }
+        if stop_at_end || ended_naturally {
+            self.request_frame_async(ctx);
         }
 
         // 2. Poll async single-frame scrub result
@@ -1762,6 +1764,8 @@ impl VideoEditor {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_lowercase();
+                let target_video_kbps =
+                    compute_target_video_kbps(&self.info, self.quality, self.format);
                 job = Some(VideoExportJob {
                     input,
                     output,
@@ -1779,6 +1783,7 @@ impl VideoEditor {
                     source_audio_codec: self.info.audio_codec.clone(),
                     has_audio: self.info.has_audio,
                     source_ext,
+                    target_video_kbps,
                 });
             }
         }
@@ -1791,6 +1796,49 @@ impl VideoEditor {
 
         job
     }
+}
+
+pub fn compute_target_video_kbps(
+    info: &MediaInfo,
+    quality: VideoQuality,
+    format: VideoFormat,
+) -> Option<u32> {
+    if quality == VideoQuality::Original {
+        return None;
+    }
+
+    let pixels = (info.width.max(320) as f64) * (info.height.max(240) as f64);
+    let res_factor = (pixels / (1920.0 * 1080.0)).powf(0.75).clamp(0.15, 3.5);
+    let fps = if info.fps > 1.0 { info.fps } else { 30.0 };
+    let fps_factor = (fps / 30.0).clamp(0.75, 2.0).powf(0.45);
+
+    let base = match quality {
+        VideoQuality::Original => unreachable!(),
+        VideoQuality::High => 5500.0,
+        VideoQuality::Balanced => 2600.0,
+        VideoQuality::Compact => 1100.0,
+    };
+
+    let mut kbps = base * res_factor * fps_factor;
+
+    let orig_total_kbps = (info.file_size as f64 * 8.0) / (info.duration_secs.max(0.1) * 1000.0);
+    if orig_total_kbps > 150.0 {
+        let orig_video_kbps =
+            (orig_total_kbps - if info.has_audio { 192.0 } else { 0.0 }).max(150.0);
+        let cap = match quality {
+            VideoQuality::High => 0.78,
+            VideoQuality::Balanced => 0.48,
+            VideoQuality::Compact => 0.25,
+            VideoQuality::Original => 1.0,
+        };
+        kbps = kbps.min(orig_video_kbps * cap);
+    }
+
+    if format == VideoFormat::Webm {
+        kbps *= 0.80;
+    }
+
+    Some(kbps.clamp(250.0, 50_000.0).round() as u32)
 }
 
 pub fn run_video_export(
@@ -2026,44 +2074,123 @@ fn build_mp4_encode_cmd(
     vf_parts.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
     cmd.args(["-vf", &vf_parts.join(",")]);
 
-    let cq = match job.quality {
-        VideoQuality::Original => "19",
-        VideoQuality::High => "22",
-        VideoQuality::Balanced => "27",
-        VideoQuality::Compact => "33",
-    };
+    if let Some(kbps) = job.target_video_kbps {
+        let maxrate = ((kbps as f64 * 1.25).round() as u32).max(kbps + 100);
+        let bufsize = kbps * 2;
+        let bv_arg = format!("{}k", kbps);
+        let maxrate_arg = format!("{}k", maxrate);
+        let bufsize_arg = format!("{}k", bufsize);
 
-    match hw_enc {
-        Some("h264_nvenc") => {
-            cmd.args([
-                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", cq, "-b:v", "0",
-                "-pix_fmt", "yuv420p",
-            ]);
+        match hw_enc {
+            Some("h264_nvenc") => {
+                cmd.args([
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p4",
+                    "-rc",
+                    "vbr",
+                    "-b:v",
+                    &bv_arg,
+                    "-maxrate",
+                    &maxrate_arg,
+                    "-bufsize",
+                    &bufsize_arg,
+                    "-pix_fmt",
+                    "yuv420p",
+                ]);
+            }
+            Some("h264_qsv") => {
+                cmd.args([
+                    "-c:v",
+                    "h264_qsv",
+                    "-b:v",
+                    &bv_arg,
+                    "-maxrate",
+                    &maxrate_arg,
+                    "-bufsize",
+                    &bufsize_arg,
+                    "-pix_fmt",
+                    "nv12",
+                ]);
+            }
+            Some("h264_amf") => {
+                cmd.args([
+                    "-c:v",
+                    "h264_amf",
+                    "-quality",
+                    "balanced",
+                    "-rc",
+                    "vbr_peak",
+                    "-b:v",
+                    &bv_arg,
+                    "-maxrate",
+                    &maxrate_arg,
+                    "-bufsize",
+                    &bufsize_arg,
+                    "-pix_fmt",
+                    "yuv420p",
+                ]);
+            }
+            _ => {
+                cmd.args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "fast",
+                    "-threads",
+                    "0",
+                    "-b:v",
+                    &bv_arg,
+                    "-maxrate",
+                    &maxrate_arg,
+                    "-bufsize",
+                    &bufsize_arg,
+                    "-pix_fmt",
+                    "yuv420p",
+                ]);
+            }
         }
-        Some("h264_qsv") => {
-            cmd.args([
-                "-c:v", "h264_qsv", "-global_quality", cq, "-pix_fmt", "nv12",
-            ]);
-        }
-        Some("h264_amf") => {
-            cmd.args([
-                "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", cq, "-qp_p",
-                cq, "-pix_fmt", "yuv420p",
-            ]);
-        }
-        _ => {
-            cmd.args([
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-threads",
-                "0",
-                "-crf",
-                job.quality.crf(),
-                "-pix_fmt",
-                "yuv420p",
-            ]);
+    } else {
+        let cq = match job.quality {
+            VideoQuality::Original => "19",
+            VideoQuality::High => "22",
+            VideoQuality::Balanced => "27",
+            VideoQuality::Compact => "33",
+        };
+
+        match hw_enc {
+            Some("h264_nvenc") => {
+                cmd.args([
+                    "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+                    "-pix_fmt", "yuv420p",
+                ]);
+            }
+            Some("h264_qsv") => {
+                cmd.args([
+                    "-c:v", "h264_qsv", "-global_quality", cq, "-pix_fmt", "nv12",
+                ]);
+            }
+            Some("h264_amf") => {
+                cmd.args([
+                    "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", cq, "-qp_p",
+                    cq, "-pix_fmt", "yuv420p",
+                ]);
+            }
+            _ => {
+                cmd.args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "fast",
+                    "-threads",
+                    "0",
+                    "-crf",
+                    job.quality.crf(),
+                    "-pix_fmt",
+                    "yuv420p",
+                ]);
+            }
         }
     }
 
@@ -2106,11 +2233,24 @@ fn build_webm_cmd(
         "good",
         "-threads",
         "0",
-        "-crf",
-        job.quality.crf(),
-        "-b:v",
-        "0",
     ]);
+    if let Some(kbps) = job.target_video_kbps {
+        let maxrate = ((kbps as f64 * 1.25).round() as u32).max(kbps + 100);
+        let bufsize = kbps * 2;
+        let bv_arg = format!("{}k", kbps);
+        let maxrate_arg = format!("{}k", maxrate);
+        let bufsize_arg = format!("{}k", bufsize);
+        cmd.args([
+            "-b:v",
+            &bv_arg,
+            "-maxrate",
+            &maxrate_arg,
+            "-bufsize",
+            &bufsize_arg,
+        ]);
+    } else {
+        cmd.args(["-crf", job.quality.crf(), "-b:v", "0"]);
+    }
 
     if !job.has_audio || job.audio_mode == VideoAudioMode::Mute {
         cmd.arg("-an");
@@ -2175,5 +2315,69 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     } else {
         let head: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{}…", head)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_dvr_info() -> MediaInfo {
+        MediaInfo {
+            duration_secs: 150.0,
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+            codec: "H264".to_string(),
+            audio_codec: "AAC".to_string(),
+            has_audio: true,
+            bitrate_kbps: 31_000,
+            file_size: (583.1_f64 * 1024.0 * 1024.0) as u64,
+        }
+    }
+
+    #[test]
+    fn target_bitrate_scales_monotonically_with_quality() {
+        let info = sample_dvr_info();
+        assert_eq!(
+            compute_target_video_kbps(&info, VideoQuality::Original, VideoFormat::Mp4),
+            None
+        );
+
+        let high = compute_target_video_kbps(&info, VideoQuality::High, VideoFormat::Mp4).unwrap();
+        let bal = compute_target_video_kbps(&info, VideoQuality::Balanced, VideoFormat::Mp4).unwrap();
+        let cmp = compute_target_video_kbps(&info, VideoQuality::Compact, VideoFormat::Mp4).unwrap();
+
+        assert!(high > bal && bal > cmp);
+        // 1080p60 High should be around 7500 kbps (~5500 * 1.366)
+        assert!((7000..=8000).contains(&high), "high kbps = {}", high);
+    }
+
+    #[test]
+    fn estimate_matches_target_bitrate_for_dvr_clip() {
+        let mut ed = VideoEditor::default();
+        ed.info = sample_dvr_info();
+        ed.trim_start = 0.0;
+        ed.trim_end = ed.info.duration_secs;
+        ed.format = VideoFormat::Mp4;
+        ed.audio_mode = VideoAudioMode::Keep;
+
+        ed.quality = VideoQuality::Original;
+        let est_orig = ed.estimate_output_bytes();
+        assert_eq!(est_orig, ed.info.file_size);
+
+        ed.quality = VideoQuality::High;
+        let est_high = ed.estimate_output_bytes();
+
+        ed.quality = VideoQuality::Balanced;
+        let est_bal = ed.estimate_output_bytes();
+
+        ed.quality = VideoQuality::Compact;
+        let est_cmp = ed.estimate_output_bytes();
+
+        assert!(est_orig > est_high && est_high > est_bal && est_bal > est_cmp);
+        // For 150s @ ~7512 kbps video + 192 kbps audio, estimate should be ~140-150 MB
+        let mb = est_high as f64 / (1024.0 * 1024.0);
+        assert!(mb > 130.0 && mb < 160.0, "est_high MB = {:.1}", mb);
     }
 }

@@ -227,9 +227,9 @@ impl PhotoEditor {
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let (w, h) = img.dimensions();
 
-        // Fast preview base (max 1000px on longest side)
-        let preview = if w > 1000 || h > 1000 {
-            img.thumbnail(1000, 1000)
+        // Crisp preview base (max 1920px on longest side)
+        let preview = if w > 1920 || h > 1920 {
+            img.resize(1920, 1920, image::imageops::FilterType::Lanczos3)
         } else {
             img.clone()
         };
@@ -1511,11 +1511,11 @@ fn apply_photo_pipeline(
         apply_resize && params.custom_resize && params.target_width > 0 && params.target_height > 0;
     let resize_dims = if want_resize {
         if is_preview {
-            if params.target_width <= 1000 && params.target_height <= 1000 {
+            if params.target_width <= 1920 && params.target_height <= 1920 {
                 Some((params.target_width, params.target_height))
             } else {
-                let k = (1000.0 / params.target_width as f32)
-                    .min(1000.0 / params.target_height as f32);
+                let k = (1920.0 / params.target_width as f32)
+                    .min(1920.0 / params.target_height as f32);
                 Some((
                     ((params.target_width as f32 * k).round() as u32).max(1),
                     ((params.target_height as f32 * k).round() as u32).max(1),

@@ -118,6 +118,7 @@ pub struct MediaInfo {
     pub duration_secs: f64,
     pub width: u32,
     pub height: u32,
+    pub fps: f64,
     pub codec: String,
     pub audio_codec: String,
     pub has_audio: bool,
@@ -141,7 +142,7 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
             "-v",
             "error",
             "-show_entries",
-            "format=duration,bit_rate:stream=codec_type,codec_name,width,height:stream_side_data=rotation:stream_tags=rotate",
+            "format=duration,bit_rate:stream=codec_type,codec_name,width,height,avg_frame_rate:stream_side_data=rotation:stream_tags=rotate",
             "-of",
             "default=noprint_wrappers=0",
         ])
@@ -166,6 +167,7 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
     let mut s_w = 0_u32;
     let mut s_h = 0_u32;
     let mut s_rot = 0_i32;
+    let mut s_fps = 0.0_f64;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -177,12 +179,16 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
                 s_w = 0;
                 s_h = 0;
                 s_rot = 0;
+                s_fps = 0.0;
             }
             "[/STREAM]" => {
                 if in_stream {
                     if s_type == "video" {
                         if info.codec.is_empty() && !s_codec.is_empty() {
                             info.codec = s_codec.clone();
+                        }
+                        if info.fps <= 0.0 && s_fps > 0.0 {
+                            info.fps = s_fps;
                         }
                         if info.width == 0 && s_w > 0 && s_h > 0 {
                             if (s_rot.abs() % 180) == 90 {
@@ -223,6 +229,21 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, String> {
                             "rotation" | "TAG:rotate" => {
                                 if let Ok(r) = v.parse::<f64>() {
                                     s_rot = r.round() as i32;
+                                }
+                            }
+                            "avg_frame_rate" => {
+                                if let Some((num_s, den_s)) = v.split_once('/') {
+                                    if let (Ok(num), Ok(den)) =
+                                        (num_s.trim().parse::<f64>(), den_s.trim().parse::<f64>())
+                                    {
+                                        if num > 0.0 && den > 0.0 {
+                                            s_fps = (num / den).clamp(1.0, 240.0);
+                                        }
+                                    }
+                                } else if let Ok(fps) = v.parse::<f64>() {
+                                    if fps > 0.0 {
+                                        s_fps = fps.clamp(1.0, 240.0);
+                                    }
                                 }
                             }
                             _ => {}
@@ -284,7 +305,7 @@ pub fn extract_video_frame(
     flip_h: bool,
     flip_v: bool,
 ) -> Result<egui::ColorImage, String> {
-    let mut vf_parts = vec!["scale='min(960,iw)':-2".to_string()];
+    let mut vf_parts = vec!["scale='min(1920,iw)':-2:flags=lanczos".to_string()];
     push_video_transform_filters(&mut vf_parts, rotation_deg, flip_h, flip_v);
     let vf = vf_parts.join(",");
 
@@ -305,7 +326,7 @@ pub fn extract_video_frame(
             "-f",
             "image2pipe",
             "-vcodec",
-            "png",
+            "bmp",
             "-",
         ])
         .output()
